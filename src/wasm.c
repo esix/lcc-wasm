@@ -176,7 +176,16 @@ static void emitaddr(Node p);
 static void emitcall(Node p) {
 	Node f = p->kids[0];
 	if (f && generic(f->op) == ADDRG && isfunc(f->syms[0]->type)) {
-		bfmt(&funcs, "call $%s\n", f->syms[0]->name);          /* direct */
+		if (variadic(f->syms[0]->type)) {
+			/* varargs ABI (va-buffer layout) must be co-designed with the runtime
+			   libc -> deferred to M5. Stub: discard args, yield 0, keep module valid. */
+			int i;
+			for (i = 0; i < nargwt; i++) bput(&funcs, "drop\n");
+			bfmt(&funcs, ";; TODO M5 varargs call to %s\n", f->syms[0]->name);
+			if (optype(p->op) != V) bfmt(&funcs, "%s.const 0\n", opprefix(p->op));
+		} else {
+			bfmt(&funcs, "call $%s\n", f->syms[0]->name);      /* direct */
+		}
 	} else {
 		int i;
 		emitexpr(f);                                           /* push function-pointer (table index) */
@@ -289,13 +298,22 @@ static void emitaddr(Node p) {
 	}
 }
 
+/* push the ADDRESS of a struct (B-type) operand: a struct rvalue is INDIRB(addr),
+   so unwrap the INDIR and evaluate its address operand */
+static void emitba(Node n) {
+	if (n && generic(n->op) == INDIR && optype(n->op) == B) emitexpr(n->kids[0]);
+	else emitexpr(n);   /* scalar INDIR (e.g. *dp) already yields the address as its value */
+}
+
 /* emit one statement-level forest root */
 static void emitroot(Node p) {
 	switch (generic(p->op)) {
 	case ASGN: {
 		Node dst = p->kids[0];
-		if (optype(p->op) == B) {
-			bfmt(&funcs, ";; UNSUPPORTED struct ASGN (M4)\n");
+		if (optype(p->op) == B) {                               /* struct copy -> memory.copy */
+			emitba(p->kids[0]);                                 /* dest address */
+			emitba(p->kids[1]);                                 /* src address */
+			bfmt(&funcs, "i32.const %lu\nmemory.copy\n", (unsigned long)p->syms[0]->u.c.v.u);
 		} else if (dst && (generic(dst->op) == ADDRL || generic(dst->op) == ADDRF) && SKIND(dst->syms[0]) == K_WLOCAL) {
 			emitexpr(p->kids[1]);                               /* scalar wasm-local store */
 			bfmt(&funcs, "local.set %d\n", SVAL(dst->syms[0]));
