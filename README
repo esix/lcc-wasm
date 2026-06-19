@@ -1,3 +1,32 @@
+=== lcc-wasm fork: a WebAssembly back end for lcc ===
+
+This fork of drh/lcc adds a WebAssembly target, so lcc can compile C to a
+runnable .wasm module. The goal is an in-browser C compiler small enough to
+ship into a web page (unlike the multi-megabyte clang/emscripten toolchain).
+
+  build/rcc -target=wasm foo.c > foo.wat   # emit WebAssembly text
+  wat2wasm foo.wat -o foo.wasm             # assemble to binary (WABT)
+
+The back end (src/wasm.c, registered in bind.c) emits .wat text and leaves the
+binary encoding to wat2wasm. It follows the bytecode.c model -- wants_dag=0, no
+lburg/register allocation -- because lcc emits its IR in post-order, which is
+already WebAssembly's stack-machine evaluation order. Scalar, non-address-taken
+locals/params become wasm locals; output is buffered into import/func/export
+sections so imports precede definitions as wat2wasm requires.
+
+Status (milestones; see PLAN.md in the repo root):
+  M1 DONE  straight-line code: arithmetic/bitwise/shift/neg/const, scalar
+           locals, direct calls (env imports), return.
+  M2 next  control flow (br_table giant-loop dispatch for LABEL/JUMP/compare).
+  M3+      shadow stack & linear memory, full C surface, in-browser pipeline.
+
+Modern toolchains: src builds with the relaxed flags in custom.mk (clang treats
+K&R implicit declarations as hard errors). Build with: make BUILDDIR=build rcc.
+
+Upstream lcc README follows.
+
+----------------------------------------------------------------------
+
 This hierarchy is the distribution for lcc version 4.2.
 
 lcc version 3.x is described in the book "A Retargetable C Compiler:
