@@ -73,6 +73,11 @@ static char *wasmtype(Type ty) {
 	return ty->size <= 4 ? "i32" : "i64";   /* int/unsigned/pointer/enum */
 }
 
+/* parameter type: structs/unions are passed by pointer (wants_argb=0) */
+static char *paramtype(Type ty) {
+	return isstruct(ty) ? "i32" : wasmtype(ty);
+}
+
 /* wasm type prefix for an arithmetic opcode, from its type-class + size */
 static char *opprefix(int op) {
 	int sz = opsize(op);
@@ -191,7 +196,7 @@ static void emitcall(Node p) {
 		emitexpr(f);                                           /* push function-pointer (table index) */
 		bput(&funcs, "call_indirect");
 		for (i = 0; i < nargwt; i++) bfmt(&funcs, " (param %s)", argwt[i]);
-		if (optype(p->op) != V) bfmt(&funcs, " (result %s)", opprefix(p->op));
+		if (optype(p->op) != V && optype(p->op) != B) bfmt(&funcs, " (result %s)", opprefix(p->op));
 		bput(&funcs, "\n");
 	}
 	nargwt = 0;
@@ -336,7 +341,7 @@ static void emitroot(Node p) {
 		return;
 	case CALL:
 		emitcall(p);
-		if (optype(p->op) != V) bfmt(&funcs, "drop\n");   /* discarded result */
+		if (optype(p->op) != V && optype(p->op) != B) bfmt(&funcs, "drop\n");   /* discarded scalar result */
 		return;
 	case LABEL:
 		/* segment boundary: close the block for the segment we're entering */
@@ -430,12 +435,12 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 				else if (g >= EQ && g <= NE) usedispatch = 1;
 			}
 
-	/* function header */
+	/* function header (struct return -> hidden pointer param + void result) */
 	bfmt(&funcs, "(func $%s", f->name);
 	for (i = 0; caller[i]; i++)
-		bfmt(&funcs, " (param %s)", wasmtype(caller[i]->type));
+		bfmt(&funcs, " (param %s)", paramtype(caller[i]->type));
 	rty = freturn(f->type);
-	if (unqual(rty)->op != VOID)
+	if (unqual(rty)->op != VOID && !isstruct(rty))
 		bfmt(&funcs, " (result %s)", wasmtype(rty));
 	bput(&funcs, "\n");
 	/* local declarations (after params in the index space) */
@@ -484,11 +489,11 @@ static void I(import)(Symbol p) {
 		int i;
 		for (i = 0; ty->u.f.proto[i]; i++)
 			if (unqual(ty->u.f.proto[i])->op != VOID)
-				bfmt(&imports, " (param %s)", wasmtype(ty->u.f.proto[i]));
+				bfmt(&imports, " (param %s)", paramtype(ty->u.f.proto[i]));
 	}
 	{
 		Type rty = freturn(ty);
-		if (unqual(rty)->op != VOID)
+		if (unqual(rty)->op != VOID && !isstruct(rty))
 			bfmt(&imports, " (result %s)", wasmtype(rty));
 	}
 	bput(&imports, "))\n");
