@@ -52,9 +52,11 @@ static int nextlocal;            /* next wasm local index to assign */
 static char *localtype[MAXLOCALS]; /* wasm type of declared (non-param) locals */
 static int nlocaltypes;
 
-/* wasm local index stashed in sym->x.offset as (index+1); 0 == unassigned */
-#define WIDX(sym) ((sym)->x.offset - 1)
-#define HASWIDX(sym) ((sym)->x.offset != 0)
+/* per-symbol storage classification, tagged in x.usecount; the value (wasm
+   local index / shadow-stack frame offset / absolute data address) is in x.offset */
+enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA };
+#define SKIND(s) ((s)->x.usecount)
+#define SVAL(s)  ((s)->x.offset)
 
 /* ---- type mapping ---- */
 static char *wasmtype(Type ty) {
@@ -90,7 +92,67 @@ static char *cmpsuffix(int op) {
 static int usedispatch;   /* function has goto-style control flow -> giant-loop dispatch */
 static int segcount;      /* number of basic-block segments (entry + each label) */
 
+/* ---- linear memory / data state ---- */
+#define MEMPAGES 256                 /* 256 * 64KiB = 16 MiB */
+#define STACKTOP (MEMPAGES * 65536)
+static Buf data;                     /* accumulated (data ...) segments */
+static Buf pending;                  /* raw bytes of the current data segment */
+static int pendaddr;                 /* start address of the pending segment */
+static int dataoff = 16;             /* next free data address (0..15 reserved/NULL) */
+static int curseg;                   /* current CODE/DATA/BSS/LIT segment */
+static int framebytes;                /* per-function shadow-stack frame bytes */
+
+/* append one raw byte to the pending data segment (handles NUL) */
+static void praw(int c) {
+	if (pending.len + 1 > pending.cap) {
+		pending.cap = (pending.cap + 1) * 2;
+		pending.p = realloc(pending.p, pending.cap);
+		assert(pending.p);
+	}
+	pending.p[pending.len++] = (char)c;
+}
+
+/* does symbol s live in linear memory (vs being a wasm local)? */
+static int inmem(Symbol s) {
+	return s->addressed || !(isarith(s->type) || isptr(s->type));
+}
+
+/* assign/return a data symbol's absolute address (lazy -> handles forward refs) */
+static int gaddr(Symbol s) {
+	if (SKIND(s) != K_DATA) {
+		int a = s->type->align ? s->type->align : 1;
+		dataoff = roundup(dataoff, a);
+		SVAL(s) = dataoff;
+		SKIND(s) = K_DATA;
+		dataoff += s->type->size > 0 ? s->type->size : a;
+	}
+	return SVAL(s);
+}
+
+static char *loadinstr(int op) {
+	int sz = opsize(op), u = optype(op) == U;
+	if (optype(op) == F) return sz == 4 ? "f32.load" : "f64.load";
+	switch (sz) {
+	case 1:  return u ? "i32.load8_u"  : "i32.load8_s";
+	case 2:  return u ? "i32.load16_u" : "i32.load16_s";
+	case 8:  return "i64.load";
+	default: return "i32.load";
+	}
+}
+
+static char *storeinstr(int op) {
+	int sz = opsize(op);
+	if (optype(op) == F) return sz == 4 ? "f32.store" : "f64.store";
+	switch (sz) {
+	case 1:  return "i32.store8";
+	case 2:  return "i32.store16";
+	case 8:  return "i64.store";
+	default: return "i32.store";
+	}
+}
+
 static void emitexpr(Node p);
+static void emitaddr(Node p);
 
 /* emit "call $name" for a direct CALL; args already pushed by ARG roots */
 static void emitcall(Node p) {
@@ -118,13 +180,12 @@ static void emitexpr(Node p) {
 		}
 		break;
 	case INDIR:
-		if (l && (generic(l->op) == ADDRL || generic(l->op) == ADDRF) && HASWIDX(l->syms[0])) {
-			if (l->syms[0]->addressed)
-				bfmt(&funcs, ";; UNSUPPORTED address-taken local (needs shadow stack, M3)\n");
-			bfmt(&funcs, "local.get %d\n", WIDX(l->syms[0]));
-			return;
+		if (l && (generic(l->op) == ADDRL || generic(l->op) == ADDRF) && SKIND(l->syms[0]) == K_WLOCAL) {
+			bfmt(&funcs, "local.get %d\n", SVAL(l->syms[0]));   /* scalar wasm-local fast path */
+		} else {
+			emitaddr(l);                                        /* push address */
+			bfmt(&funcs, "%s\n", loadinstr(op));
 		}
-		bfmt(&funcs, ";; UNSUPPORTED INDIR (memory load, M3)\n");
 		return;
 	case ADD: emitexpr(l); emitexpr(r); bfmt(&funcs, "%s.add\n", opprefix(op)); return;
 	case SUB: emitexpr(l); emitexpr(r); bfmt(&funcs, "%s.sub\n", opprefix(op)); return;
@@ -173,10 +234,37 @@ static void emitexpr(Node p) {
 		return;
 	}
 	case ADDRG: case ADDRL: case ADDRF:
-		bfmt(&funcs, ";; UNSUPPORTED address-of (memory, M3)\n");
+		emitaddr(p);
 		return;
 	}
 	bfmt(&funcs, ";; UNSUPPORTED expr op=%s\n", opname(op));
+}
+
+/* push the ADDRESS of an lvalue/symbol */
+static void emitaddr(Node p) {
+	Symbol s;
+	switch (generic(p->op)) {
+	case ADDRG:
+		s = p->syms[0];
+		if (isfunc(s->type)) {   /* function pointer -> table index (M4) */
+			bfmt(&funcs, ";; UNSUPPORTED function pointer %s (M4)\ni32.const 0\n", s->name);
+		} else {
+			bfmt(&funcs, "i32.const %d\n", gaddr(s));
+		}
+		return;
+	case ADDRL: case ADDRF:
+		s = p->syms[0];
+		if (SKIND(s) == K_FRAME) {
+			if (SVAL(s) == 0) bput(&funcs, "local.get $fb\n");
+			else bfmt(&funcs, "local.get $fb\ni32.const %d\ni32.add\n", SVAL(s));
+		} else {
+			bfmt(&funcs, ";; UNSUPPORTED &wasm-local (expected addressed)\ni32.const 0\n");
+		}
+		return;
+	default:
+		emitexpr(p);   /* general address expression (e.g. a pointer value) */
+		return;
+	}
 }
 
 /* emit one statement-level forest root */
@@ -184,17 +272,22 @@ static void emitroot(Node p) {
 	switch (generic(p->op)) {
 	case ASGN: {
 		Node dst = p->kids[0];
-		if (dst && (generic(dst->op) == ADDRL || generic(dst->op) == ADDRF) && HASWIDX(dst->syms[0])
-		    && !dst->syms[0]->addressed && optype(p->op) != B) {
-			emitexpr(p->kids[1]);
-			bfmt(&funcs, "local.set %d\n", WIDX(dst->syms[0]));
+		if (optype(p->op) == B) {
+			bfmt(&funcs, ";; UNSUPPORTED struct ASGN (M4)\n");
+		} else if (dst && (generic(dst->op) == ADDRL || generic(dst->op) == ADDRF) && SKIND(dst->syms[0]) == K_WLOCAL) {
+			emitexpr(p->kids[1]);                               /* scalar wasm-local store */
+			bfmt(&funcs, "local.set %d\n", SVAL(dst->syms[0]));
 		} else {
-			bfmt(&funcs, ";; UNSUPPORTED ASGN to memory/struct (M3)\n");
+			emitaddr(dst);                                      /* address */
+			emitexpr(p->kids[1]);                               /* value */
+			bfmt(&funcs, "%s\n", storeinstr(p->op));
 		}
 		return;
 	}
 	case RET:
 		if (p->kids[0]) emitexpr(p->kids[0]);
+		if (framebytes > 0)
+			bfmt(&funcs, "local.get $fb\ni32.const %d\ni32.add\nglobal.set $sp\n", framebytes);
 		bfmt(&funcs, "return\n");
 		return;
 	case ARG:
@@ -244,8 +337,17 @@ static void I(emit)(Node forest) {
 }
 
 static void I(local)(Symbol p) {
+	if (inmem(p)) {                              /* address-taken or aggregate -> shadow stack */
+		int a = p->type->align ? p->type->align : 1;
+		framebytes = roundup(framebytes, a);
+		SVAL(p) = framebytes;                 /* frame offset (may be 0) */
+		SKIND(p) = K_FRAME;
+		framebytes += p->type->size;
+		return;
+	}
 	if (nextlocal >= MAXLOCALS) { bfmt(&funcs, ";; too many locals\n"); return; }
-	p->x.offset = nextlocal + 1;                 /* wasm local index = nextlocal */
+	SVAL(p) = nextlocal;                         /* wasm local index */
+	SKIND(p) = K_WLOCAL;
 	if (nlocaltypes < MAXLOCALS)
 		localtype[nlocaltypes++] = wasmtype(p->type);
 	nextlocal++;
@@ -259,9 +361,13 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 
 	nextlocal = 0;
 	nlocaltypes = 0;
+	framebytes = 0;
 	for (i = 0; caller[i] && callee[i]; i++) {
-		caller[i]->x.offset = callee[i]->x.offset = i + 1;   /* params get indices 0..n-1 */
+		SVAL(caller[i]) = SVAL(callee[i]) = i;               /* params -> wasm locals 0..n-1 */
+		SKIND(caller[i]) = SKIND(callee[i]) = K_WLOCAL;
 		nextlocal = i + 1;
+		if (inmem(caller[i]))
+			bfmt(&funcs, ";; NOTE addressed/aggregate param %s not yet spilled (M4)\n", caller[i]->name);
 	}
 	offset = maxoffset = argoffset = maxargoffset = 0;
 
@@ -293,6 +399,14 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 		bfmt(&funcs, "  (local %s)\n", localtype[i]);
 	if (usedispatch)
 		bput(&funcs, "  (local $state i32)\n");
+	if (framebytes > 0) {
+		framebytes = roundup(framebytes, 16);
+		bput(&funcs, "  (local $fb i32)\n");
+	}
+
+	/* shadow-stack prologue: $fb = ($sp -= framebytes) */
+	if (framebytes > 0)
+		bfmt(&funcs, "global.get $sp\ni32.const %d\ni32.sub\nlocal.tee $fb\nglobal.set $sp\n", framebytes);
 
 	/* dispatch scaffolding: one loop + a br_table over per-segment blocks */
 	if (usedispatch) {
@@ -314,7 +428,8 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 }
 
 static void I(export)(Symbol p) {
-	bfmt(&exports, "(export \"%s\" (func $%s))\n", p->name, p->name);
+	if (isfunc(p->type))   /* data globals live in memory; nothing to export in the wasm sense */
+		bfmt(&exports, "(export \"%s\" (func $%s))\n", p->name, p->name);
 }
 
 static void I(import)(Symbol p) {
@@ -349,30 +464,85 @@ static void I(defsymbol)(Symbol p) {
 		p->x.name = p->name;
 }
 
+/* flush the pending data segment as a (data (i32.const A) "..") directive */
+static void flushdata(void) {
+	int i;
+	if (pending.len <= 0) return;
+	bfmt(&data, "(data (i32.const %d) \"", pendaddr);
+	for (i = 0; i < pending.len; i++)
+		bfmt(&data, "\\%02x", (unsigned char)pending.p[i]);
+	bput(&data, "\")\n");
+	pending.len = 0;
+}
+
 static void I(progbeg)(int argc, char *argv[]) {
-	imports.p = funcs.p = exports.p = 0;
-	imports.len = funcs.len = exports.len = 0;
-	imports.cap = funcs.cap = exports.cap = 0;
+	imports.p = funcs.p = exports.p = data.p = 0;
+	imports.len = funcs.len = exports.len = data.len = 0;
+	imports.cap = funcs.cap = exports.cap = data.cap = 0;
+	pending.p = 0; pending.len = pending.cap = 0;
+	dataoff = 16; curseg = 0;
 }
 
 static void I(progend)(void) {
+	flushdata();
 	print("(module\n");
 	if (imports.p) print("%s", imports.p);
+	print("(memory %d)\n", MEMPAGES);
+	print("(export \"memory\" (memory 0))\n");
+	print("(global $sp (mut i32) (i32.const %d))\n", STACKTOP);
 	if (funcs.p)   print("%s", funcs.p);
 	if (exports.p) print("%s", exports.p);
+	if (data.p)    print("%s", data.p);
 	print(")\n");
 }
 
-/* ---- minimal / deferred hooks ---- */
-static void I(address)(Symbol q, Symbol p, long n) { q->x.name = stringf("%s%s%D", p->x.name, n > 0 ? "+" : "", n); }
+/* ---- data / segment hooks ---- */
+static void I(segment)(int s) { curseg = s; }
+
+static void I(global)(Symbol p) {
+	flushdata();
+	pendaddr = gaddr(p);
+}
+
+static void I(defconst)(int suffix, int size, Value v) {
+	int i;
+	if (suffix == F) {
+		if (size == 4) { float f = (float)v.d; unsigned char *b = (unsigned char *)&f; for (i = 0; i < 4; i++) praw(b[i]); }
+		else           { double d = (double)v.d; unsigned char *b = (unsigned char *)&d; for (i = 0; i < 8; i++) praw(b[i]); }
+		return;
+	}
+	{
+		unsigned long val = suffix == P ? (unsigned long)(size_t)v.p
+		                  : suffix == U ? v.u : (unsigned long)v.i;
+		for (i = 0; i < size; i++) praw((val >> (8 * i)) & 0xff);
+	}
+}
+
+static void I(defstring)(int len, char *s) {
+	int i;
+	for (i = 0; i < len; i++) praw((unsigned char)s[i]);
+}
+
+static void I(space)(int n) {       /* BSS is zero by default; only pad inside initialized data */
+	int i;
+	if (curseg != BSS) for (i = 0; i < n; i++) praw(0);
+}
+
+static void I(defaddress)(Symbol p) {   /* pointer-sized address of a data symbol */
+	int a, i;
+	if (isfunc(p->type) || p->scope == LABELS) { for (i = 0; i < 4; i++) praw(0); return; } /* M3b */
+	a = gaddr(p);
+	for (i = 0; i < 4; i++) praw((a >> (8 * i)) & 0xff);
+}
+
+static void I(address)(Symbol q, Symbol p, long n) {
+	/* q aliases p+n: inherit p's storage kind so member/element addresses route correctly */
+	if (SKIND(p) == K_NONE) gaddr(p);          /* unseen base must be a data symbol */
+	SKIND(q) = SKIND(p);
+	SVAL(q) = SVAL(p) + (int)n;
+}
 static void I(blockbeg)(Env *e) {}
 static void I(blockend)(Env *e) {}
-static void I(defaddress)(Symbol p) {}     /* M3: data segments */
-static void I(defconst)(int suffix, int size, Value v) {}
-static void I(defstring)(int len, char *s) {}
-static void I(global)(Symbol p) {}
-static void I(segment)(int s) {}
-static void I(space)(int n) {}
 
 Interface wasmIR = {
 	1, 1, 0,	/* char */
