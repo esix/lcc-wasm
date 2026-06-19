@@ -54,9 +54,16 @@ static int nlocaltypes;
 
 /* per-symbol storage classification, tagged in x.usecount; the value (wasm
    local index / shadow-stack frame offset / absolute data address) is in x.offset */
-enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA };
+enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA, K_FUNC };
 #define SKIND(s) ((s)->x.usecount)
 #define SVAL(s)  ((s)->x.offset)
+
+/* ---- indirect function table (for function pointers / call_indirect) ---- */
+#define MAXFUNCS 4096
+static char *tablefn[MAXFUNCS];   /* function names, indexed by table slot */
+static int ntable;
+static char *argwt[64];           /* wasm types of args accumulated for the pending call */
+static int nargwt;
 
 /* ---- type mapping ---- */
 static char *wasmtype(Type ty) {
@@ -151,18 +158,34 @@ static char *storeinstr(int op) {
 	}
 }
 
+/* assign/return a function's table slot (its function-pointer value) */
+static int funcindex(Symbol s) {
+	if (SKIND(s) != K_FUNC) {
+		SKIND(s) = K_FUNC;
+		SVAL(s) = ntable;
+		if (ntable < MAXFUNCS) tablefn[ntable] = s->name;
+		ntable++;
+	}
+	return SVAL(s);
+}
+
 static void emitexpr(Node p);
 static void emitaddr(Node p);
 
-/* emit "call $name" for a direct CALL; args already pushed by ARG roots */
+/* emit a CALL; scalar args were already pushed by the preceding ARG roots */
 static void emitcall(Node p) {
 	Node f = p->kids[0];
-	if (f && generic(f->op) == ADDRG) {
-		bfmt(&funcs, "call $%s\n", f->syms[0]->name);
+	if (f && generic(f->op) == ADDRG && isfunc(f->syms[0]->type)) {
+		bfmt(&funcs, "call $%s\n", f->syms[0]->name);          /* direct */
 	} else {
-		/* indirect call -> M3 (needs table + type) */
-		bfmt(&funcs, ";; UNSUPPORTED indirect CALL\n");
+		int i;
+		emitexpr(f);                                           /* push function-pointer (table index) */
+		bput(&funcs, "call_indirect");
+		for (i = 0; i < nargwt; i++) bfmt(&funcs, " (param %s)", argwt[i]);
+		if (optype(p->op) != V) bfmt(&funcs, " (result %s)", opprefix(p->op));
+		bput(&funcs, "\n");
 	}
+	nargwt = 0;
 }
 
 /* push the value of expression tree p onto the wasm operand stack */
@@ -246,11 +269,10 @@ static void emitaddr(Node p) {
 	switch (generic(p->op)) {
 	case ADDRG:
 		s = p->syms[0];
-		if (isfunc(s->type)) {   /* function pointer -> table index (M4) */
-			bfmt(&funcs, ";; UNSUPPORTED function pointer %s (M4)\ni32.const 0\n", s->name);
-		} else {
+		if (isfunc(s->type))   /* function pointer value = its table slot */
+			bfmt(&funcs, "i32.const %d\n", funcindex(s));
+		else
 			bfmt(&funcs, "i32.const %d\n", gaddr(s));
-		}
 		return;
 	case ADDRL: case ADDRF:
 		s = p->syms[0];
@@ -292,6 +314,7 @@ static void emitroot(Node p) {
 		return;
 	case ARG:
 		emitexpr(p->kids[0]);   /* leave on stack for the upcoming CALL */
+		if (nargwt < 64) argwt[nargwt++] = opprefix(p->op);
 		return;
 	case CALL:
 		emitcall(p);
@@ -481,17 +504,28 @@ static void I(progbeg)(int argc, char *argv[]) {
 	imports.cap = funcs.cap = exports.cap = data.cap = 0;
 	pending.p = 0; pending.len = pending.cap = 0;
 	dataoff = 16; curseg = 0;
+	ntable = 0; nargwt = 0;
 }
 
 static void I(progend)(void) {
+	int i;
 	flushdata();
 	print("(module\n");
 	if (imports.p) print("%s", imports.p);
 	print("(memory %d)\n", MEMPAGES);
 	print("(export \"memory\" (memory 0))\n");
+	if (ntable > 0) {
+		print("(table %d funcref)\n", ntable);
+		print("(export \"__indirect_function_table\" (table 0))\n");
+	}
 	print("(global $sp (mut i32) (i32.const %d))\n", STACKTOP);
 	if (funcs.p)   print("%s", funcs.p);
 	if (exports.p) print("%s", exports.p);
+	if (ntable > 0) {
+		print("(elem (i32.const 0)");
+		for (i = 0; i < ntable; i++) print(" $%s", tablefn[i]);
+		print(")\n");
+	}
 	if (data.p)    print("%s", data.p);
 	print(")\n");
 }
