@@ -344,10 +344,13 @@ static void emitroot(Node p) {
 		return;
 	case JUMP: {
 		Node a = p->kids[0];
-		if (usedispatch && a && generic(a->op) == ADDRG)
+		if (!usedispatch) return;
+		if (a && generic(a->op) == ADDRG) {           /* direct: goto label */
 			bfmt(&funcs, "i32.const %d\nlocal.set $state\nbr $top\n", a->syms[0]->x.offset);
-		else
-			bfmt(&funcs, ";; UNSUPPORTED indirect JUMP (switch table, M3)\n");
+		} else {                                       /* indirect: switch jump-table dispatch */
+			emitexpr(a);                               /* loads the target segment index from the table */
+			bput(&funcs, "local.set $state\nbr $top\n");
+		}
 		return;
 	}
 	case EQ: case NE: case LT: case LE: case GT: case GE:
@@ -580,11 +583,13 @@ static void I(space)(int n) {       /* BSS is zero by default; only pad inside i
 	if (curseg != BSS) for (i = 0; i < n; i++) praw(0);
 }
 
-static void I(defaddress)(Symbol p) {   /* pointer-sized address of a data symbol */
-	int a, i;
-	if (isfunc(p->type) || p->scope == LABELS) { for (i = 0; i < 4; i++) praw(0); return; } /* M3b */
-	a = gaddr(p);
-	for (i = 0; i < 4; i++) praw((a >> (8 * i)) & 0xff);
+static void putaddr(int a) { int i; for (i = 0; i < 4; i++) praw((a >> (8 * i)) & 0xff); }
+
+static void I(defaddress)(Symbol p) {   /* pointer-sized datum: a symbol's address */
+	if (p->scope == LABELS)   putaddr(p->x.offset);    /* switch jump-table entry = segment index */
+	else if (!p->type)        putaddr(0);
+	else if (isfunc(p->type)) putaddr(funcindex(p));   /* function pointer stored in data */
+	else                      putaddr(gaddr(p));        /* address of a data symbol */
 }
 
 static void I(address)(Symbol q, Symbol p, long n) {
