@@ -72,6 +72,24 @@ static char *opprefix(int op) {
 	return sz <= 4 ? "i32" : "i64";
 }
 
+/* wasm compare suffix for a comparison opcode (signedness from operand type) */
+static char *cmpsuffix(int op) {
+	int t = optype(op);
+	switch (generic(op)) {
+	case EQ: return "eq";
+	case NE: return "ne";
+	case LT: return t == F ? "lt" : t == U ? "lt_u" : "lt_s";
+	case LE: return t == F ? "le" : t == U ? "le_u" : "le_s";
+	case GT: return t == F ? "gt" : t == U ? "gt_u" : "gt_s";
+	case GE: return t == F ? "ge" : t == U ? "ge_u" : "ge_s";
+	}
+	return "eq";
+}
+
+/* control-flow state for the current function */
+static int usedispatch;   /* function has goto-style control flow -> giant-loop dispatch */
+static int segcount;      /* number of basic-block segments (entry + each label) */
+
 static void emitexpr(Node p);
 
 /* emit "call $name" for a direct CALL; args already pushed by ARG roots */
@@ -186,10 +204,28 @@ static void emitroot(Node p) {
 		emitcall(p);
 		if (optype(p->op) != V) bfmt(&funcs, "drop\n");   /* discarded result */
 		return;
-	case LABEL: case JUMP:
+	case LABEL:
+		/* segment boundary: close the block for the segment we're entering */
+		if (usedispatch) bput(&funcs, "end\n");
+		return;
+	case JUMP: {
+		Node a = p->kids[0];
+		if (usedispatch && a && generic(a->op) == ADDRG)
+			bfmt(&funcs, "i32.const %d\nlocal.set $state\nbr $top\n", a->syms[0]->x.offset);
+		else
+			bfmt(&funcs, ";; UNSUPPORTED indirect JUMP (switch table, M3)\n");
+		return;
+	}
 	case EQ: case NE: case LT: case LE: case GT: case GE:
-		/* control flow -> M2 (br_table dispatch); skip in M1 */
-		bfmt(&funcs, ";; M2 control-flow: %s\n", opname(p->op));
+		/* compare-and-branch: if (k0 <cmp> k1) goto syms[0] */
+		if (usedispatch) {
+			emitexpr(p->kids[0]);
+			emitexpr(p->kids[1]);
+			bfmt(&funcs, "%s.%s\n", opprefix(p->op), cmpsuffix(p->op));
+			bfmt(&funcs, "if\ni32.const %d\nlocal.set $state\nbr $top\nend\n", p->syms[0]->x.offset);
+		} else {
+			bfmt(&funcs, ";; UNSUPPORTED compare-branch without dispatch\n");
+		}
 		return;
 	}
 	bfmt(&funcs, ";; UNSUPPORTED stmt op=%s\n", opname(p->op));
@@ -218,6 +254,8 @@ static void I(local)(Symbol p) {
 static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
 	int i;
 	Type rty;
+	Code cp;
+	Node p;
 
 	nextlocal = 0;
 	nlocaltypes = 0;
@@ -228,6 +266,19 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	offset = maxoffset = argoffset = maxargoffset = 0;
 
 	gencode(caller, callee);   /* triggers local() for each local/temp (indices n..) */
+
+	/* pre-pass: number basic-block segments (entry = 0; each label = 1,2,...)
+	   and detect goto-style control flow */
+	segcount = 1;
+	usedispatch = 0;
+	for (cp = codehead.next; cp; cp = cp->next)
+		if (cp->kind == Gen || cp->kind == Jump || cp->kind == Label)
+			for (p = cp->u.forest; p; p = p->link) {
+				int g = generic(p->op);
+				if (g == LABEL) p->syms[0]->x.offset = segcount++;
+				else if (g == JUMP) usedispatch = 1;
+				else if (g >= EQ && g <= NE) usedispatch = 1;
+			}
 
 	/* function header */
 	bfmt(&funcs, "(func $%s", f->name);
@@ -240,8 +291,25 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	/* local declarations (after params in the index space) */
 	for (i = 0; i < nlocaltypes; i++)
 		bfmt(&funcs, "  (local %s)\n", localtype[i]);
+	if (usedispatch)
+		bput(&funcs, "  (local $state i32)\n");
 
-	emitcode();                /* emits body via gen()/emit() */
+	/* dispatch scaffolding: one loop + a br_table over per-segment blocks */
+	if (usedispatch) {
+		bput(&funcs, "block $exit\nloop $top\n");
+		for (i = segcount - 1; i >= 0; i--)
+			bfmt(&funcs, "block $S%d\n", i);
+		bput(&funcs, "local.get $state\nbr_table");
+		for (i = 0; i < segcount; i++)
+			bfmt(&funcs, " $S%d", i);
+		bput(&funcs, " $exit\n");
+		bput(&funcs, "end\n");   /* closes $S0; entry segment (state 0) falls through here */
+	}
+
+	emitcode();                /* emits body; LABEL/JUMP/compare handled in emitroot */
+
+	if (usedispatch)
+		bput(&funcs, "end\nend\nunreachable\n");   /* close loop $top, block $exit */
 	bput(&funcs, ")\n");
 }
 
