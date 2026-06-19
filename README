@@ -4,24 +4,52 @@ This fork of drh/lcc adds a WebAssembly target, so lcc can compile C to a
 runnable .wasm module. The goal is an in-browser C compiler small enough to
 ship into a web page (unlike the multi-megabyte clang/emscripten toolchain).
 
-  build/rcc -target=wasm foo.c > foo.wat   # emit WebAssembly text
-  wat2wasm foo.wat -o foo.wasm             # assemble to binary (WABT)
+It works today: real C -- arithmetic, loops, if/switch, recursion, pointers,
+arrays, structs, function pointers -- compiles and runs in node AND the browser.
+See examples/hello-world for a complete, runnable demo (199-byte module).
 
-The back end (src/wasm.c, registered in bind.c) emits .wat text and leaves the
-binary encoding to wat2wasm. It follows the bytecode.c model -- wants_dag=0, no
-lburg/register allocation -- because lcc emits its IR in post-order, which is
-already WebAssembly's stack-machine evaluation order. Scalar, non-address-taken
-locals/params become wasm locals; output is buffered into import/func/export
-sections so imports precede definitions as wat2wasm requires.
+--- Quick start -------------------------------------------------------
 
-Status (milestones; see PLAN.md in the repo root):
-  M1 DONE  straight-line code: arithmetic/bitwise/shift/neg/const, scalar
-           locals, direct calls (env imports), return.
-  M2 next  control flow (br_table giant-loop dispatch for LABEL/JUMP/compare).
-  M3+      shadow stack & linear memory, full C surface, in-browser pipeline.
+  # 1. build the compiler (clang needs relaxed flags for K&R-era source;
+  #    they live in custom.mk, so a plain make works)
+  make BUILDDIR=build rcc
 
-Modern toolchains: src builds with the relaxed flags in custom.mk (clang treats
-K&R implicit declarations as hard errors). Build with: make BUILDDIR=build rcc.
+  # 2. compile C -> WebAssembly text -> binary
+  build/rcc -target=wasm foo.c > foo.wat   # our back end emits .wat
+  wat2wasm foo.wat -o foo.wasm             # WABT assembles to .wasm
+                                           # (brew install wabt)
+
+  # 3. run it -- see examples/hello-world
+  cd examples/hello-world && ./build.sh
+  node run-node.js                         # -> Hello, world from lcc-wasm!
+  node serve.js                            # then open http://localhost:8080/
+
+There is no libc yet: a program reaches the outside world by calling functions
+IMPORTED from the host (node/browser JS), exactly as a winweb app calls its
+runtime. hello.c imports putchar(); the JS host supplies it.
+
+--- How the back end works --------------------------------------------
+
+src/wasm.c (registered in bind.c) emits .wat text and leaves binary encoding to
+wat2wasm. It follows the bytecode.c model -- wants_dag=0, no lburg/register
+allocation -- because lcc emits its IR in post-order, which is already
+WebAssembly's stack-machine evaluation order. Scalar, non-address-taken
+locals/params become wasm locals; address-taken/aggregate locals live on a
+shadow stack in linear memory (global $sp); globals/strings become (data)
+segments; goto-style control flow becomes a br_table "giant loop" dispatch;
+function pointers use an indirect (table) + call_indirect. Output is buffered
+into import/memory/table/func/export/data so it assembles in module order.
+
+--- Status (milestones; see PLAN.md in the repo root) -----------------
+
+  M1 DONE  arithmetic/bitwise/shift/casts, scalar locals, direct calls, return
+  M2 DONE  control flow: for/while/if/switch/recursion (br_table dispatch)
+  M3 DONE  linear memory + shadow stack; globals/strings; loads/stores;
+           pointers, arrays, struct fields
+  M4 ....  function pointers (call_indirect) and struct copy DONE; varargs and
+           struct-by-value still TODO
+  M5 next  in-browser pipeline: cpp+rcc via emcc, MEMFS, Win32 host imports
+  M6 goal  self-host: compile lcc itself to wasm
 
 Upstream lcc README follows.
 

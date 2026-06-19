@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>lcc-wasm — hello world</title></head>
+<body style="font-family:monospace;background:#111;color:#0f0;padding:24px">
+  <h3>C compiled to WebAssembly by lcc-wasm, running in your browser</h3>
+  <pre id="out"></pre>
+  <script>
+    // The host provides putchar(); the wasm module (compiled from hello.c by
+    // lcc-wasm) calls it once per character.
+    const out = document.getElementById("out");
+    const env = {
+      putchar: (c) => { out.textContent += String.fromCharCode(c & 0xff); return c; },
+    };
+    fetch("hello.wasm")
+      .then((r) => r.arrayBuffer())
+      .then((buf) => WebAssembly.instantiate(buf, { env }))
+      .then(({ instance }) => {
+        const rc = instance.exports.main();
+        out.textContent += "\n[main() returned " + rc + "]";
+      })
+      .catch((e) => { out.textContent = "error: " + e; });
+  </script>
+</body>
+</html>
