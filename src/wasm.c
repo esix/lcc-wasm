@@ -54,16 +54,19 @@ static int nlocaltypes;
 
 /* per-symbol storage classification, tagged in x.usecount; the value (wasm
    local index / shadow-stack frame offset / absolute data address) is in x.offset */
-enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA, K_FUNC };
+/* K_ARGBUF: parameter of a variadic function, living in the caller-provided
+   shadow-stack arg buffer at offset SVAL, addressed via local $args. */
+enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA, K_FUNC, K_ARGBUF };
 #define SKIND(s) ((s)->x.usecount)
 #define SVAL(s)  ((s)->x.offset)
+#define VASLOT 8                  /* every marshalled arg occupies an 8-byte slot */
 
 /* ---- indirect function table (for function pointers / call_indirect) ---- */
 #define MAXFUNCS 4096
 static char *tablefn[MAXFUNCS];   /* function names, indexed by table slot */
 static int ntable;
-static char *argwt[64];           /* wasm types of args accumulated for the pending call */
-static int nargwt;
+static Node argvec[64];           /* ARG nodes collected for the pending call (emission deferred) */
+static int argc;
 
 /* ---- type mapping ---- */
 static char *wasmtype(Type ty) {
@@ -177,29 +180,44 @@ static int funcindex(Symbol s) {
 static void emitexpr(Node p);
 static void emitaddr(Node p);
 
-/* emit a CALL; scalar args were already pushed by the preceding ARG roots */
+/* emit a CALL. Args were collected (not emitted) by the preceding ARG roots so
+   that a variadic callee can marshal them into a shadow-stack buffer. */
 static void emitcall(Node p) {
 	Node f = p->kids[0];
-	if (f && generic(f->op) == ADDRG && isfunc(f->syms[0]->type)) {
-		if (variadic(f->syms[0]->type)) {
-			/* varargs ABI (va-buffer layout) must be co-designed with the runtime
-			   libc -> deferred to M5. Stub: discard args, yield 0, keep module valid. */
-			int i;
-			for (i = 0; i < nargwt; i++) bput(&funcs, "drop\n");
-			bfmt(&funcs, ";; TODO M5 varargs call to %s\n", f->syms[0]->name);
-			if (optype(p->op) != V) bfmt(&funcs, "%s.const 0\n", opprefix(p->op));
-		} else {
-			bfmt(&funcs, "call $%s\n", f->syms[0]->name);      /* direct */
+	Node args[64];
+	int n = argc, i, direct;
+	Symbol fn = (f && generic(f->op) == ADDRG && isfunc(f->syms[0]->type)) ? f->syms[0] : NULL;
+
+	for (i = 0; i < n; i++) args[i] = argvec[i];   /* snapshot; reset so nested calls don't clobber */
+	argc = 0;
+	direct = fn != NULL;
+
+	if (direct && variadic(fn->type)) {
+		/* marshal every arg into an 8-byte-slot buffer on the shadow stack;
+		   pass a pointer to it as the callee's single argument. */
+		int bufsize = roundup(n * VASLOT, 16);
+		bfmt(&funcs, "global.get $sp\ni32.const %d\ni32.sub\nglobal.set $sp\n", bufsize);
+		for (i = 0; i < n; i++) {
+			bput(&funcs, "global.get $sp\n");
+			emitexpr(args[i]->kids[0]);
+			bfmt(&funcs, "%s.store offset=%d\n", opprefix(args[i]->op), i * VASLOT);
 		}
+		bput(&funcs, "global.get $sp\n");                 /* arg = buffer base */
+		bfmt(&funcs, "call $%s\n", fn->name);
+		bfmt(&funcs, "global.get $sp\ni32.const %d\ni32.add\nglobal.set $sp\n", bufsize);
+		return;
+	}
+
+	for (i = 0; i < n; i++) emitexpr(args[i]->kids[0]);   /* push args */
+	if (direct) {
+		bfmt(&funcs, "call $%s\n", fn->name);
 	} else {
-		int i;
-		emitexpr(f);                                           /* push function-pointer (table index) */
+		emitexpr(f);                                       /* push function-pointer (table index) */
 		bput(&funcs, "call_indirect");
-		for (i = 0; i < nargwt; i++) bfmt(&funcs, " (param %s)", argwt[i]);
+		for (i = 0; i < n; i++) bfmt(&funcs, " (param %s)", opprefix(args[i]->op));
 		if (optype(p->op) != V && optype(p->op) != B) bfmt(&funcs, " (result %s)", opprefix(p->op));
 		bput(&funcs, "\n");
 	}
-	nargwt = 0;
 }
 
 /* push the value of expression tree p onto the wasm operand stack */
@@ -293,6 +311,9 @@ static void emitaddr(Node p) {
 		if (SKIND(s) == K_FRAME) {
 			if (SVAL(s) == 0) bput(&funcs, "local.get $fb\n");
 			else bfmt(&funcs, "local.get $fb\ni32.const %d\ni32.add\n", SVAL(s));
+		} else if (SKIND(s) == K_ARGBUF) {              /* variadic-function param in the arg buffer */
+			if (SVAL(s) == 0) bput(&funcs, "local.get $args\n");
+			else bfmt(&funcs, "local.get $args\ni32.const %d\ni32.add\n", SVAL(s));
 		} else {
 			bfmt(&funcs, ";; UNSUPPORTED &wasm-local (expected addressed)\ni32.const 0\n");
 		}
@@ -336,8 +357,7 @@ static void emitroot(Node p) {
 		bfmt(&funcs, "return\n");
 		return;
 	case ARG:
-		emitexpr(p->kids[0]);   /* leave on stack for the upcoming CALL */
-		if (nargwt < 64) argwt[nargwt++] = opprefix(p->op);
+		if (argc < 64) argvec[argc++] = p;   /* defer; emitted by emitcall (per-callee ABI) */
 		return;
 	case CALL:
 		emitcall(p);
@@ -408,15 +428,23 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	Code cp;
 	Node p;
 
+	int isva = variadic(f->type);
 	nextlocal = 0;
 	nlocaltypes = 0;
 	framebytes = 0;
-	for (i = 0; caller[i] && callee[i]; i++) {
-		SVAL(caller[i]) = SVAL(callee[i]) = i;               /* params -> wasm locals 0..n-1 */
-		SKIND(caller[i]) = SKIND(callee[i]) = K_WLOCAL;
-		nextlocal = i + 1;
-		if (inmem(caller[i]))
-			bfmt(&funcs, ";; NOTE addressed/aggregate param %s not yet spilled (M4)\n", caller[i]->name);
+	if (isva) {
+		/* one wasm param ($args = local 0); C params live in the arg buffer */
+		nextlocal = 1;
+		for (i = 0; caller[i] && callee[i]; i++) {
+			SVAL(caller[i]) = SVAL(callee[i]) = i * VASLOT;
+			SKIND(caller[i]) = SKIND(callee[i]) = K_ARGBUF;
+		}
+	} else {
+		for (i = 0; caller[i] && callee[i]; i++) {
+			SVAL(caller[i]) = SVAL(callee[i]) = i;       /* params -> wasm locals 0..n-1 */
+			SKIND(caller[i]) = SKIND(callee[i]) = K_WLOCAL;
+			nextlocal = i + 1;
+		}
 	}
 	offset = maxoffset = argoffset = maxargoffset = 0;
 
@@ -437,8 +465,11 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 
 	/* function header (struct return -> hidden pointer param + void result) */
 	bfmt(&funcs, "(func $%s", f->name);
-	for (i = 0; caller[i]; i++)
-		bfmt(&funcs, " (param %s)", paramtype(caller[i]->type));
+	if (isva)
+		bput(&funcs, " (param $args i32)");           /* pointer to the marshalled arg buffer */
+	else
+		for (i = 0; caller[i]; i++)
+			bfmt(&funcs, " (param %s)", paramtype(caller[i]->type));
 	rty = freturn(f->type);
 	if (unqual(rty)->op != VOID && !isstruct(rty))
 		bfmt(&funcs, " (result %s)", wasmtype(rty));
@@ -485,7 +516,9 @@ static void I(import)(Symbol p) {
 	Type ty = p->type;
 	if (!isfunc(ty)) { bfmt(&imports, ";; UNSUPPORTED data import %s (M3)\n", p->name); return; }
 	bfmt(&imports, "(import \"env\" \"%s\" (func $%s", p->name, p->name);
-	if (ty->u.f.proto) {
+	if (variadic(ty)) {
+		bput(&imports, " (param i32)");   /* single pointer to the marshalled arg buffer */
+	} else if (ty->u.f.proto) {
 		int i;
 		for (i = 0; ty->u.f.proto[i]; i++)
 			if (unqual(ty->u.f.proto[i])->op != VOID)
@@ -530,7 +563,7 @@ static void I(progbeg)(int argc, char *argv[]) {
 	imports.cap = funcs.cap = exports.cap = data.cap = 0;
 	pending.p = 0; pending.len = pending.cap = 0;
 	dataoff = 16; curseg = 0;
-	ntable = 0; nargwt = 0;
+	ntable = 0; argc = 0;
 }
 
 static void I(progend)(void) {
@@ -540,10 +573,10 @@ static void I(progend)(void) {
 	if (imports.p) print("%s", imports.p);
 	print("(memory %d)\n", MEMPAGES);
 	print("(export \"memory\" (memory 0))\n");
-	if (ntable > 0) {
-		print("(table %d funcref)\n", ntable);
-		print("(export \"__indirect_function_table\" (table 0))\n");
-	}
+	/* always declare the table so a call_indirect validates even in a unit that
+	   takes no function address locally (the elem is populated only if ntable>0) */
+	print("(table %d funcref)\n", ntable);
+	print("(export \"__indirect_function_table\" (table 0))\n");
 	print("(global $sp (mut i32) (i32.const %d))\n", STACKTOP);
 	if (funcs.p)   print("%s", funcs.p);
 	if (exports.p) print("%s", exports.p);
