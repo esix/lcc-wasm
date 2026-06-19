@@ -57,6 +57,7 @@ RCCOBJS=$Balloc$O \
 	$Bsymbolic$O \
 	$Bgen$O \
 	$Bbytecode$O \
+	$Bwasm$O \
 	$Balpha$O \
 	$Bmips$O \
 	$Bsparc$O \
@@ -97,6 +98,7 @@ $Bstring$O:	src/string.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/string.c
 $Bsym$O:	src/sym.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/sym.c
 $Bsymbolic$O:	src/symbolic.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/symbolic.c
 $Bbytecode$O:	src/bytecode.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/bytecode.c
+$Bwasm$O:	src/wasm.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/wasm.c
 $Btrace$O:	src/trace.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/trace.c
 $Btree$O:	src/tree.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/tree.c
 $Btypes$O:	src/types.c;	$(CC) $(CFLAGS) -c -Isrc -o $@ src/types.c
