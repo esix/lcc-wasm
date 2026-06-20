@@ -160,6 +160,11 @@ static int defderived(Symbol base, int off) {
 }
 static int framebytes;                /* per-function shadow-stack frame bytes */
 
+/* address-taken scalar params: each lives in the frame (so &param works) but its
+   value arrives in a wasm param slot, so the prologue copies it into the frame */
+static struct { int widx, off; Type ty; } spillp[64];
+static int nspillp;
+
 /* append one raw byte to the pending data segment (handles NUL) */
 static void praw(int c) {
 	if (pending.len + 1 > pending.cap) {
@@ -493,6 +498,7 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	nextlocal = 0;
 	nlocaltypes = 0;
 	framebytes = 0;
+	nspillp = 0;
 	if (isva) {
 		/* one wasm param ($args = local 0); C params live in the arg buffer */
 		nextlocal = 1;
@@ -502,8 +508,26 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 		}
 	} else {
 		for (i = 0; caller[i] && callee[i]; i++) {
-			SVAL(caller[i]) = SVAL(callee[i]) = i;       /* params -> wasm locals 0..n-1 */
-			SKIND(caller[i]) = SKIND(callee[i]) = K_WLOCAL;
+			Symbol cee = callee[i], cer = caller[i];
+			if ((cee->addressed || cer->addressed)
+			&&  (isarith(cee->type) || isptr(cee->type))) {
+				/* address-taken scalar param: lives in the frame so &param works;
+				   the incoming wasm arg (local i) is copied into the slot below */
+				int a = cee->type->align ? cee->type->align : 1;
+				framebytes = roundup(framebytes, a);
+				SVAL(cer) = SVAL(cee) = framebytes;
+				SKIND(cer) = SKIND(cee) = K_FRAME;
+				if (nspillp < 64) {
+					spillp[nspillp].widx = i;
+					spillp[nspillp].off = framebytes;
+					spillp[nspillp].ty = cee->type;
+					nspillp++;
+				}
+				framebytes += cee->type->size;
+			} else {
+				SVAL(cer) = SVAL(cee) = i;               /* param -> wasm local 0..n-1 */
+				SKIND(cer) = SKIND(cee) = K_WLOCAL;
+			}
 			nextlocal = i + 1;
 		}
 	}
@@ -552,6 +576,18 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	/* shadow-stack prologue: $fb = ($sp -= framebytes) */
 	if (framebytes > 0)
 		bfmt(&funcs, "global.get $sp\ni32.const %d\ni32.sub\nlocal.tee $fb\nglobal.set $sp\n", framebytes);
+
+	/* copy address-taken scalar params from their wasm arg slot into the frame */
+	for (i = 0; i < nspillp; i++) {
+		Type ty = spillp[i].ty;
+		char *st = isfloat(ty) ? (ty->size <= 4 ? "f32.store" : "f64.store")
+		                       : (ty->size <= 4 ? "i32.store" : "i64.store");
+		if (spillp[i].off == 0)
+			bfmt(&funcs, "local.get $fb\nlocal.get %d\n%s\n", spillp[i].widx, st);
+		else
+			bfmt(&funcs, "local.get $fb\ni32.const %d\ni32.add\nlocal.get %d\n%s\n",
+				spillp[i].off, spillp[i].widx, st);
+	}
 
 	/* dispatch scaffolding: one loop + a br_table over per-segment blocks */
 	if (usedispatch) {
