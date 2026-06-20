@@ -110,10 +110,14 @@ static int segcount;      /* number of basic-block segments (entry + each label)
 /* ---- linear memory / data state ---- */
 #define MEMPAGES 256                 /* 256 * 64KiB = 16 MiB */
 #define STACKTOP (MEMPAGES * 65536)
+#define LITBASE 0x80000              /* string/constant region, kept separate from DATA */
 static Buf data;                     /* accumulated (data ...) segments */
 static Buf pending;                  /* raw bytes of the current data segment */
 static int pendaddr;                 /* start address of the pending segment */
-static int dataoff = 16;             /* next free data address (0..15 reserved/NULL) */
+static int dataoff = 16;             /* next free DATA/BSS address (0..15 = NULL) */
+static int litoff = LITBASE;         /* next free LIT address (string/constant literals) */
+static int *curoff = &dataoff;       /* region counter for the symbol being defined */
+static int noadvance;                /* defining a forward-referenced symbol -> space already reserved */
 static int curseg;                   /* current CODE/DATA/BSS/LIT segment */
 static int framebytes;                /* per-function shadow-stack frame bytes */
 
@@ -127,19 +131,30 @@ static void praw(int c) {
 	pending.p[pending.len++] = (char)c;
 }
 
+/* emit one data byte and advance the active region counter (unless we are
+   filling a forward-referenced symbol whose space was already reserved) */
+static void emitbyte(int c) {
+	praw(c);
+	if (!noadvance) (*curoff)++;
+}
+
 /* does symbol s live in linear memory (vs being a wasm local)? */
 static int inmem(Symbol s) {
 	return s->addressed || !(isarith(s->type) || isptr(s->type));
 }
 
-/* assign/return a data symbol's absolute address (lazy -> handles forward refs) */
+/* assign/return a data symbol's absolute address. Forward references (a symbol
+   used before its global()/data is emitted) get an eager address by type size;
+   the actual definition (global) byte-counts instead -> see I(global). Generated
+   string/constant literals live in their own LIT region so a forward ref to one
+   during another symbol's data emission cannot overlap it. */
 static int gaddr(Symbol s) {
 	if (SKIND(s) != K_DATA) {
 		int a = s->type->align ? s->type->align : 1;
-		dataoff = roundup(dataoff, a);
-		SVAL(s) = dataoff;
+		int sz = s->type->size > 0 ? s->type->size : a;
+		if (s->generated) { litoff = roundup(litoff, a); SVAL(s) = litoff; litoff += sz; }
+		else              { dataoff = roundup(dataoff, a); SVAL(s) = dataoff; dataoff += sz; }
 		SKIND(s) = K_DATA;
-		dataoff += s->type->size > 0 ? s->type->size : a;
 	}
 	return SVAL(s);
 }
@@ -429,6 +444,7 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	Node p;
 
 	int isva = variadic(f->type);
+	int hasresult;
 	nextlocal = 0;
 	nlocaltypes = 0;
 	framebytes = 0;
@@ -471,7 +487,8 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 		for (i = 0; caller[i]; i++)
 			bfmt(&funcs, " (param %s)", paramtype(caller[i]->type));
 	rty = freturn(f->type);
-	if (unqual(rty)->op != VOID && !isstruct(rty))
+	hasresult = unqual(rty)->op != VOID && !isstruct(rty);
+	if (hasresult)
 		bfmt(&funcs, " (result %s)", wasmtype(rty));
 	bput(&funcs, "\n");
 	/* a function with a compile error has no body (gencode/emitcode skip on
@@ -506,7 +523,15 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	emitcode();                /* emits body; LABEL/JUMP/compare handled in emitroot */
 
 	if (usedispatch)
-		bput(&funcs, "end\nend\nunreachable\n");   /* close loop $top, block $exit */
+		bput(&funcs, "end\nend\n");   /* close loop $top, block $exit */
+	if (hasresult) {
+		/* value function reaching here never returned (UB) -> keep wasm valid */
+		if (usedispatch) bput(&funcs, "unreachable\n");
+	} else if (framebytes > 0) {
+		/* void function: falling off the end IS the implicit return, so the
+		   shadow-stack frame must be popped here too (the RET path does its own) */
+		bfmt(&funcs, "local.get $fb\ni32.const %d\ni32.add\nglobal.set $sp\n", framebytes);
+	}
 	bput(&funcs, ")\n");
 }
 
@@ -549,7 +574,10 @@ static void I(defsymbol)(Symbol p) {
 		p->x.name = p->name;
 }
 
-/* flush the pending data segment as a (data (i32.const A) "..") directive */
+/* flush the pending data segment as a (data (i32.const A) "..") directive, and
+   advance the active region counter by the ACTUAL bytes written (so an
+   incomplete-array global, whose type->size is 0 at global() time, still
+   reserves the right amount of space). */
 static void flushdata(void) {
 	int i;
 	if (pending.len <= 0) return;
@@ -565,7 +593,7 @@ static void I(progbeg)(int argc, char *argv[]) {
 	imports.len = funcs.len = exports.len = data.len = 0;
 	imports.cap = funcs.cap = exports.cap = data.cap = 0;
 	pending.p = 0; pending.len = pending.cap = 0;
-	dataoff = 16; curseg = 0;
+	dataoff = 16; litoff = LITBASE; curoff = &dataoff; noadvance = 0; curseg = 0;
 	ntable = 0; argc = 0;
 }
 
@@ -596,35 +624,53 @@ static void I(progend)(void) {
 static void I(segment)(int s) { curseg = s; }
 
 static void I(global)(Symbol p) {
+	int a = p->type->align ? p->type->align : 1;
 	flushdata();
-	pendaddr = gaddr(p);
+	curoff = p->generated ? &litoff : &dataoff;
+	if (SKIND(p) != K_DATA) {
+		/* defining p here: assign its address and byte-count its size as the data
+		   hooks run (handles incomplete arrays whose type->size is still 0 now) */
+		*curoff = roundup(*curoff, a);
+		SVAL(p) = *curoff;
+		SKIND(p) = K_DATA;
+		noadvance = 0;
+	} else {
+		noadvance = 1;   /* forward-referenced: space already reserved by gaddr */
+	}
+	pendaddr = SVAL(p);
 }
 
 static void I(defconst)(int suffix, int size, Value v) {
 	int i;
 	if (suffix == F) {
-		if (size == 4) { float f = (float)v.d; unsigned char *b = (unsigned char *)&f; for (i = 0; i < 4; i++) praw(b[i]); }
-		else           { double d = (double)v.d; unsigned char *b = (unsigned char *)&d; for (i = 0; i < 8; i++) praw(b[i]); }
+		if (size == 4) { float f = (float)v.d; unsigned char *b = (unsigned char *)&f; for (i = 0; i < 4; i++) emitbyte(b[i]); }
+		else           { double d = (double)v.d; unsigned char *b = (unsigned char *)&d; for (i = 0; i < 8; i++) emitbyte(b[i]); }
 		return;
 	}
 	{
 		unsigned long val = suffix == P ? (unsigned long)(size_t)v.p
 		                  : suffix == U ? v.u : (unsigned long)v.i;
-		for (i = 0; i < size; i++) praw((val >> (8 * i)) & 0xff);
+		for (i = 0; i < size; i++) emitbyte((val >> (8 * i)) & 0xff);
 	}
 }
 
 static void I(defstring)(int len, char *s) {
 	int i;
-	for (i = 0; i < len; i++) praw((unsigned char)s[i]);
+	for (i = 0; i < len; i++) emitbyte((unsigned char)s[i]);
 }
 
-static void I(space)(int n) {       /* BSS is zero by default; only pad inside initialized data */
+static void I(space)(int n) {
 	int i;
-	if (curseg != BSS) for (i = 0; i < n; i++) praw(0);
+	if (curseg == BSS) {       /* reserve n zero bytes (wasm zero-inits) without emitting data */
+		flushdata();
+		if (!noadvance) *curoff += n;
+		pendaddr = *curoff;
+	} else {
+		for (i = 0; i < n; i++) emitbyte(0);
+	}
 }
 
-static void putaddr(int a) { int i; for (i = 0; i < 4; i++) praw((a >> (8 * i)) & 0xff); }
+static void putaddr(int a) { int i; for (i = 0; i < 4; i++) emitbyte((a >> (8 * i)) & 0xff); }
 
 static void I(defaddress)(Symbol p) {   /* pointer-sized datum: a symbol's address */
 	if (p->scope == LABELS)   putaddr(p->x.offset);    /* switch jump-table entry = segment index */
