@@ -56,7 +56,9 @@ static int nlocaltypes;
    local index / shadow-stack frame offset / absolute data address) is in x.offset */
 /* K_ARGBUF: parameter of a variadic function, living in the caller-provided
    shadow-stack arg buffer at offset SVAL, addressed via local $args. */
-enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA, K_FUNC, K_ARGBUF };
+/* K_DERIVED: q = base + off where base is a data symbol not yet placed; SVAL(q)
+   holds an index into derivedtab until resolved (see gaddr / I(address)). */
+enum { K_NONE = 0, K_WLOCAL, K_FRAME, K_DATA, K_FUNC, K_ARGBUF, K_DERIVED };
 #define SKIND(s) ((s)->x.usecount)
 #define SVAL(s)  ((s)->x.offset)
 #define VASLOT 8                  /* every marshalled arg occupies an 8-byte slot */
@@ -119,6 +121,43 @@ static int litoff = LITBASE;         /* next free LIT address (string/constant l
 static int *curoff = &dataoff;       /* region counter for the symbol being defined */
 static int noadvance;                /* defining a forward-referenced symbol -> space already reserved */
 static int curseg;                   /* current CODE/DATA/BSS/LIT segment */
+
+/* Deferred code->data references. lcc sizes a jump-table symbol by the case
+   COUNT (swgen: array(voidptype, u-l+1)) but emits data spanning the value
+   RANGE (v[u]-v[l]+1, gaps filled with the default label), so type->size
+   understates the bytes emitted. Eagerly reserving an address by type->size
+   thus under-reserves and lets the table overflow into the next literal. So a
+   code reference (ADDRG) to a not-yet-defined data symbol emits a placeholder
+   token; the symbol gets its true byte-counted address from its own data
+   emission, and the token is resolved at progend. */
+static Symbol *coderefs;
+static int ncoderefs, coderefcap;
+
+static int defref(Symbol s) {
+	if (ncoderefs >= coderefcap) {
+		coderefcap = coderefcap ? coderefcap * 2 : 1024;
+		coderefs = realloc(coderefs, coderefcap * sizeof *coderefs);
+		assert(coderefs);
+	}
+	coderefs[ncoderefs] = s;
+	return ncoderefs++;
+}
+
+/* derived data symbols (q = base + off) whose base wasn't placed yet at the time
+   the alias was formed; resolved lazily by gaddr once the base has an address */
+static struct DerivedRef { Symbol base; int off; } *derivedtab;
+static int nderived, derivedcap;
+
+static int defderived(Symbol base, int off) {
+	if (nderived >= derivedcap) {
+		derivedcap = derivedcap ? derivedcap * 2 : 1024;
+		derivedtab = realloc(derivedtab, derivedcap * sizeof *derivedtab);
+		assert(derivedtab);
+	}
+	derivedtab[nderived].base = base;
+	derivedtab[nderived].off = off;
+	return nderived++;
+}
 static int framebytes;                /* per-function shadow-stack frame bytes */
 
 /* append one raw byte to the pending data segment (handles NUL) */
@@ -149,7 +188,11 @@ static int inmem(Symbol s) {
    string/constant literals live in their own LIT region so a forward ref to one
    during another symbol's data emission cannot overlap it. */
 static int gaddr(Symbol s) {
-	if (SKIND(s) != K_DATA) {
+	if (SKIND(s) == K_DERIVED) {        /* q = base + off: resolve now (base should be placed) */
+		struct DerivedRef d = derivedtab[SVAL(s)];
+		SVAL(s) = gaddr(d.base) + d.off;
+		SKIND(s) = K_DATA;
+	} else if (SKIND(s) != K_DATA) {
 		int a = s->type->align ? s->type->align : 1;
 		int sz = s->type->size > 0 ? s->type->size : a;
 		if (s->generated) { litoff = roundup(litoff, a); SVAL(s) = litoff; litoff += sz; }
@@ -318,8 +361,10 @@ static void emitaddr(Node p) {
 		s = p->syms[0];
 		if (isfunc(s->type))   /* function pointer value = its table slot */
 			bfmt(&funcs, "i32.const %d\n", funcindex(s));
-		else
-			bfmt(&funcs, "i32.const %d\n", gaddr(s));
+		else if (SKIND(s) == K_DATA)   /* already placed -> resolve inline */
+			bfmt(&funcs, "i32.const %d\n", SVAL(s));
+		else                           /* forward ref -> defer (see coderefs) */
+			bfmt(&funcs, "i32.const @@%d@@\n", defref(s));
 		return;
 	case ADDRL: case ADDRF:
 		s = p->syms[0];
@@ -597,9 +642,37 @@ static void I(progbeg)(int argc, char *argv[]) {
 	ntable = 0; argc = 0;
 }
 
+/* rewrite the funcs buffer, replacing each "@@N@@" placeholder with the now-known
+   absolute address of coderefs[N] (a data symbol referenced before it was defined) */
+static void resolverefs(void) {
+	Buf out;
+	char *p = funcs.p;
+	memset(&out, 0, sizeof out);
+	if (!p) return;
+	while (*p) {
+		if (p[0] == '@' && p[1] == '@') {
+			int idx = 0;
+			char num[16];
+			p += 2;
+			while (*p >= '0' && *p <= '9') idx = idx * 10 + (*p++ - '0');
+			p += 2;   /* closing "@@" */
+			sprintf(num, "%d", gaddr(coderefs[idx]));
+			bput(&out, num);
+		} else {
+			char one[2];
+			one[0] = *p++;
+			one[1] = 0;
+			bput(&out, one);
+		}
+	}
+	free(funcs.p);
+	funcs = out;
+}
+
 static void I(progend)(void) {
 	int i;
 	flushdata();
+	resolverefs();
 	print("(module\n");
 	if (imports.p) print("%s", imports.p);
 	print("(memory %d)\n", MEMPAGES);
@@ -680,10 +753,23 @@ static void I(defaddress)(Symbol p) {   /* pointer-sized datum: a symbol's addre
 }
 
 static void I(address)(Symbol q, Symbol p, long n) {
-	/* q aliases p+n: inherit p's storage kind so member/element addresses route correctly */
-	if (SKIND(p) == K_NONE) gaddr(p);          /* unseen base must be a data symbol */
-	SKIND(q) = SKIND(p);
-	SVAL(q) = SVAL(p) + (int)n;
+	/* q aliases p+n. If the base p is a data symbol not yet placed (K_NONE) or is
+	   itself a pending alias (K_DERIVED), defer q too -- eagerly placing p here
+	   would reserve its address by an unreliable type->size (e.g. a jump table,
+	   sized by case count but emitting value-range entries). Otherwise (p is an
+	   already-placed data symbol, a local, or an arg-buffer slot) inherit p's
+	   kind so member/element addresses route correctly. */
+	if (SKIND(p) == K_NONE) {
+		SKIND(q) = K_DERIVED;
+		SVAL(q) = defderived(p, (int)n);
+	} else if (SKIND(p) == K_DERIVED) {
+		struct DerivedRef d = derivedtab[SVAL(p)];
+		SKIND(q) = K_DERIVED;
+		SVAL(q) = defderived(d.base, d.off + (int)n);
+	} else {
+		SKIND(q) = SKIND(p);
+		SVAL(q) = SVAL(p) + (int)n;
+	}
 }
 static void I(blockbeg)(Env *e) {}
 static void I(blockend)(Env *e) {}
