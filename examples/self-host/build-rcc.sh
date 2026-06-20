@@ -15,7 +15,7 @@ RCC="${RCC:-build/rcc}"
 OUT=examples/self-host/rcc-amalg.c
 
 # front end + null/wasm back ends + main (no register back ends, no profiling)
-MIN="alloc dag decl enode error event expr init inits input lex list output simp stmt string sym trace tree types null wasm main"
+MIN="alloc dag decl enode error event expr init inits input lex list output simp stmt string sym trace tree types null wasm wasmbin main"
 
 # per-file renames to resolve file-scope name collisions in one TU
 rename() {
@@ -34,7 +34,7 @@ rename() {
   echo '#include "c.h"'
   echo 'extern Interface wasmIR, nullIR;'
   for f in $MIN; do
-    [ "$f" = main ] && echo 'Binding bindings[3] = { {"wasm", &wasmIR}, {"null", &nullIR}, {0, 0} };'
+    [ "$f" = main ] && echo 'Binding bindings[4] = { {"wasm", &wasmIR}, {"wasm-bin", &wasmIR}, {"null", &nullIR}, {0, 0} };'
     echo "/**** $f.c ****/"; rename $f
   done
   echo '/**** libc.c ****/'; cat lib/wasm/libc.c
