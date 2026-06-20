@@ -1,4 +1,4 @@
-# self-host (work in progress)
+# self-host
 
 **LCC compiling *itself* to WebAssembly with the lcc-wasm back end.**
 
@@ -9,7 +9,8 @@ producing **`rcc.wasm`** — the LCC C compiler, as a ~260 KB WebAssembly module
 ```sh
 # prereqs: (cd ../.. && make BUILDDIR=build rcc) ; brew install wabt
 ./build-rcc.sh          # -> rcc.wasm  (the compiled compiler)
-node run-node.js        # feed it C on stdin, get .wat on stdout
+node compile-and-run.js # rcc.wasm compiles a hello-world, then we run the result
+node run-node.js        # just print the .wat rcc.wasm emits for the hello-world
 ```
 
 The host (`run-node.js`) is the model from the discussion: **3 syscalls**
@@ -17,34 +18,50 @@ The host (`run-node.js`) is the model from the discussion: **3 syscalls**
 `stdout` collects the `.wat`. A browser version would back the same 3 calls with
 a JS mock filesystem; the wasm is identical.
 
-## Status: builds and runs partway
+## Status: working self-host
 
-`rcc.wasm` **builds** and **runs** — it initializes its type system, reads the
-source through the host syscalls, and **tokenizes** — but currently **traps** on
-a scale-dependent codegen bug in the tokenizer before it emits output. So this
-is **not yet a working self-host**.
+`rcc.wasm` **builds, runs, and compiles C to WebAssembly.** `compile-and-run.js`
+drives the whole loop:
+
+```
+--- rcc.wasm compiled the C source to .wat (932 bytes) ---
+--- running the result: Hello from self-hosted lcc-wasm!
+--- main() returned 0 ---
+```
+
+That is the LCC C compiler — itself running as WebAssembly — reading C source,
+emitting a `.wat` module, which `wat2wasm` assembles and node runs. A real
+compile-and-execute pipeline with no native toolchain involved.
 
 Getting here required fixing several real back-end bugs that only the
-self-hosting stress test surfaced (void-function returns, shadow-stack restore on
-fall-through, and data-segment layout for incomplete arrays and BSS). The
-remaining work is flushing out the rest of the runtime codegen bugs that a
-9,000-line input exercises — open-ended but tractable.
+self-hosting stress test surfaced:
 
-**For a fully working end-to-end demo today, see [`../hello-world`](../hello-world)** —
-real C compiled by lcc-wasm and run in both node and the browser.
+- **jump-table layout** — lcc sizes a `switch` jump-table symbol by case *count*
+  but emits one entry per value in the *range* (gaps → default), so its
+  `type->size` understates the data. Eagerly reserving its address by
+  `type->size` under-reserved and let the table overflow into the next literal,
+  corrupting the tokenizer's keyword dispatch. Fixed by deferring code→data
+  address resolution (and derived `base+offset` aliases) until each symbol is
+  byte-counted by its own definition.
+- **`printf` length/width** — the wasm back end prints constants with `%ld`/`%lu`
+  and data bytes with `%02x`; the hand-written libc `vformat` didn't handle the
+  `l` length modifier or `0`/width flags. Fixed in `lib/wasm/libc.c`.
 
-## What's verified to work in `rcc.wasm`
+## Known limitation
 
-- amalgamation of all of LCC + libc compiles through our back end with zero C errors
-- the module instantiates and `main()` runs
-- type-system init, symbol/string interning, the arg buffer, the shadow stack
-- input is read via `__read` and the lexer runs
+A few front-end constructs in the de-dag/spill pass are still miscompiled when
+LCC runs as wasm; the most visible is post-increment through a pointer (`*p++`),
+which emits an `;; UNSUPPORTED` marker. Write the equivalent with explicit
+indexing (`s[i]; i = i + 1;`) and it compiles cleanly — that is what the demo
+programs do. Native `rcc` compiles `*p++` correctly, so this is a self-host
+codegen bug, not a language gap.
 
 ## Files
 
 | file | what |
 |------|------|
-| `build-rcc.sh`  | amalgamate LCC + compile it with `rcc -target=wasm` → `rcc.wasm` |
-| `rcc.wasm`      | the compiled compiler (committed; rebuild with `build-rcc.sh`) |
-| `rcc-amalg.c`   | the generated single-TU amalgamation (intermediate) |
-| `run-node.js`   | host: syscalls + in-memory FS; feeds C in, collects `.wat` |
+| `build-rcc.sh`       | amalgamate LCC + compile it with `rcc -target=wasm` → `rcc.wasm` |
+| `rcc.wasm`           | the compiled compiler (committed; rebuild with `build-rcc.sh`) |
+| `rcc-amalg.c`        | the generated single-TU amalgamation (intermediate) |
+| `run-node.js`        | host: syscalls + in-memory FS; prints the `.wat` for a hello-world |
+| `compile-and-run.js` | full loop: compile with `rcc.wasm`, assemble, run, print greeting |

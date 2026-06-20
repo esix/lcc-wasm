@@ -2,6 +2,8 @@
 (import "env" "putchar" (func $putchar (param i32) (result i32)))
 (memory 256)
 (export "memory" (memory 0))
+(table 0 funcref)
+(export "__indirect_function_table" (table 0))
 (global $sp (mut i32) (i32.const 16777216))
 (func $main (result i32)
   (local i32)
@@ -16,7 +18,7 @@ block $S0
 local.get $state
 br_table $S0 $S1 $S2 $S3 $S4 $exit
 end
-i32.const 16
+i32.const 524288
 local.set 0
 i32.const 3
 local.set $state
@@ -49,5 +51,5 @@ end
 unreachable
 )
 (export "main" (func $main))
-(data (i32.const 16) "\48\65\6c\6c\6f\2c\20\77\6f\72\6c\64\20\66\72\6f\6d\20\6c\63\63\2d\77\61\73\6d\21\0a\00")
+(data (i32.const 524288) "\48\65\6c\6c\6f\2c\20\77\6f\72\6c\64\20\66\72\6f\6d\20\6c\63\63\2d\77\61\73\6d\21\0a\00")
 )

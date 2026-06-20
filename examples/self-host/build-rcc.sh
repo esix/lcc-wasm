@@ -7,10 +7,8 @@
 #
 # Prereqs: build rcc first  ->  (cd ../.. && make BUILDDIR=build rcc) ; brew install wabt
 #
-# STATUS: rcc.wasm builds (~260 KB) and runs -- it initializes, reads source
-# through the host syscalls, and tokenizes -- but still hits scale-dependent
-# codegen bugs in the tokenizer/parser. Self-host is WORK IN PROGRESS. The
-# hand-written ../hello-world example fully demonstrates the compiler today.
+# STATUS: working self-host. rcc.wasm (~260 KB) builds, runs, and compiles C to
+# WebAssembly -- see ./compile-and-run.js for the full compile-and-execute loop.
 set -e
 cd "$(dirname "$0")/../.."          # repo root (lcc/)
 RCC="${RCC:-build/rcc}"

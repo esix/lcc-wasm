@@ -6,13 +6,21 @@
 //
 //   node run-node.js
 //
-// NOTE: rcc.wasm is WORK IN PROGRESS -- it initializes, reads the source, and
-// tokenizes, but currently traps on a scale-dependent codegen bug before
-// emitting output. See README.md.
+// rcc.wasm is LCC's own front end + our wasm back end, compiled to wasm by
+// lcc-wasm itself. It reads the C below and prints a complete .wat module.
 const fs = require("fs");
 const path = require("path");
 
-const source = "int putchar(int c);\nint main(void){ return 0; }\n";
+const source = [
+  "int putchar(int c);",
+  "int main(void){",
+  '  char *s = "Hello from self-hosted lcc-wasm!\\n";',
+  "  int i = 0;",
+  "  while (s[i]) { putchar(s[i]); i = i + 1; }",
+  "  return 0;",
+  "}",
+  "",
+].join("\n");
 
 let mem;
 const src = Buffer.from(source), out = [];
@@ -43,7 +51,9 @@ put(A, "rcc"); put(A + 8, "-target=wasm");
 dv.setUint32(A + 32, A, true); dv.setUint32(A + 36, A + 8, true);
 
 try { inst.exports.main(2, A + 32); }
-catch (e) { console.error("[" + (e.__exit !== undefined ? "exit " + e.__exit : "trap: " + e.message) + "]"); }
+catch (e) { if (e.__exit === undefined) console.error("[trap: " + e.message + "]"); }
 
 const wat = Buffer.concat(out).toString();
-console.log(wat.length ? wat : "(no .wat emitted yet -- see NOTE above)");
+console.log(wat || "(no .wat emitted)");
+// To run the result:  node run-node.js > hello.wat && wat2wasm hello.wat -o hello.wasm
+// then instantiate hello.wasm with an `env.putchar` import -> prints the greeting.
