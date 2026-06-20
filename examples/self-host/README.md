@@ -11,12 +11,24 @@ producing **`rcc.wasm`** — the LCC C compiler, as a ~260 KB WebAssembly module
 ./build-rcc.sh          # -> rcc.wasm  (the compiled compiler)
 node compile-and-run.js # rcc.wasm compiles a hello-world, then we run the result
 node run-node.js        # just print the .wat rcc.wasm emits for the hello-world
+
+# in the browser: edit C, Compile & Run, all client-side
+node serve.js           # then open http://localhost:8080/
 ```
 
 The host (`run-node.js`) is the model from the discussion: **3 syscalls**
 (`__read`/`__write`/`__exit`) over a tiny in-memory FS — `stdin` is the source,
-`stdout` collects the `.wat`. A browser version would back the same 3 calls with
-a JS mock filesystem; the wasm is identical.
+`stdout` collects the `.wat`. The browser demo (`index.html`) backs the same 3
+calls with a JS mock filesystem; the wasm is identical.
+
+## Browser demo (`index.html`)
+
+A live, fully client-side C compiler: type C, hit **Compile & Run**, and the page
+runs `rcc.wasm` (the LCC compiler, as wasm) to emit `.wat`, assembles it with
+**wabt** (`wabt.js`, vendored from the `wabt` npm package — the one thing the
+browser can't do natively is wat→wasm), instantiates the result, and runs it —
+capturing `putchar` output. A fresh `rcc.wasm` instance per compile keeps the
+compiler's globals clean. No server-side compilation, no native toolchain.
 
 ## Status: working self-host
 
@@ -65,4 +77,7 @@ self-hosting stress test surfaced:
 | `rcc.wasm`           | the compiled compiler (committed; rebuild with `build-rcc.sh`) |
 | `rcc-amalg.c`        | the generated single-TU amalgamation (intermediate) |
 | `run-node.js`        | host: syscalls + in-memory FS; prints the `.wat` for a hello-world |
-| `compile-and-run.js` | full loop: compile with `rcc.wasm`, assemble, run, print greeting |
+| `compile-and-run.js` | node full loop: compile with `rcc.wasm`, assemble, run, print greeting |
+| `index.html`         | browser demo: edit C, Compile & Run, all client-side |
+| `wabt.js`            | vendored WABT (wat→wasm in the browser; from the `wabt` npm package) |
+| `serve.js`           | static server for the browser demo (`node serve.js` → localhost:8080) |

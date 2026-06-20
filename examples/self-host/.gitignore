@@ -1,3 +1,5 @@
 rcc-amalg.c
 rcc-amalg.i
 rcc.wat
+*.png
+.playwright-mcp/
