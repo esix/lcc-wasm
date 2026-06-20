@@ -474,6 +474,9 @@ static void I(function)(Symbol f, Symbol caller[], Symbol callee[], int ncalls) 
 	if (unqual(rty)->op != VOID && !isstruct(rty))
 		bfmt(&funcs, " (result %s)", wasmtype(rty));
 	bput(&funcs, "\n");
+	/* a function with a compile error has no body (gencode/emitcode skip on
+	   errcnt>0); emit a trivially-valid body so the module still parses */
+	if (errcnt > 0) { bput(&funcs, "unreachable\n)\n"); return; }
 	/* local declarations (after params in the index space) */
 	for (i = 0; i < nlocaltypes; i++)
 		bfmt(&funcs, "  (local %s)\n", localtype[i]);
