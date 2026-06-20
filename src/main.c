@@ -100,6 +100,12 @@ int main(int argc, char *argv[]) {
 	finalize();
 	(*IR->progend)();
 	deallocate(PERM);
+#ifdef _WASM_STDLIB_H
+	/* wasm self-host: the JS host reads the process exit status from the
+	   __exit() syscall, not from main()'s return value, so a compile error
+	   (errcnt>0) must be reported through exit() to be seen as non-zero. */
+	exit(errcnt > 0);
+#endif
 	return errcnt > 0;
 }
 /* main_init - process program arguments */
