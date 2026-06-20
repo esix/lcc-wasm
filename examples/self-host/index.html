@@ -34,12 +34,13 @@
 <header>
   <h1>lcc-wasm — a self-hosted C compiler, running in your browser</h1>
   <p>The <b>LCC C compiler itself</b> (front end + our WebAssembly back end) compiled to
-     <b>rcc.wasm</b> — it compiles the C below to a <code>.wat</code> module, which
-     <b>wabt</b> assembles and the browser runs. No server, no native toolchain.</p>
+     <b>rcc.wasm</b> — it compiles the C below straight to a <b>binary <code>.wasm</code></b>
+     module that the browser runs directly. No server, no native toolchain, no
+     assembler — just the ~280&nbsp;KB compiler.</p>
 </header>
 <div class="bar">
   <button id="run" disabled>Compile &amp; Run</button>
-  <span id="status">loading rcc.wasm + wabt…</span>
+  <span id="status">loading rcc.wasm…</span>
 </div>
 <main>
   <div class="pane">
@@ -69,19 +70,19 @@ int main(void) {
       <pre id="out"></pre>
     </div>
     <div class="pane">
-      <h2>.wat emitted by rcc.wasm &nbsp;|&nbsp; <span id="err"></span></h2>
+      <h2>.wat rcc.wasm can also emit (for reading) &nbsp;|&nbsp; <span id="err"></span></h2>
       <pre id="wat"></pre>
     </div>
   </div>
 </main>
 
-<script src="wabt.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-let rccModule, wabt;
+let rccModule;
 
-// --- run rcc.wasm (the compiler): C source (stdin) -> .wat (stdout) ---
-function compileC(source) {
+// --- run rcc.wasm (the compiler) on `source` for the given target.
+//     target "wasm-bin" -> stdout is a binary .wasm; "wasm" -> stdout is .wat text. ---
+function runRcc(source, target) {
   const src = new TextEncoder().encode(source);
   let pos = 0, mem; const out = [], err = [];
   const env = {
@@ -101,21 +102,20 @@ function compileC(source) {
   mem = inst.exports.memory;
   const A = 0x1f0000, dv = new DataView(mem.buffer), u8 = new Uint8Array(mem.buffer);
   const put = (o, s) => { for (let i = 0; i < s.length; i++) u8[o + i] = s.charCodeAt(i); u8[o + s.length] = 0; };
-  put(A, "rcc"); put(A + 8, "-target=wasm");
+  put(A, "rcc"); put(A + 8, "-target=" + target);
   dv.setUint32(A + 32, A, true); dv.setUint32(A + 36, A + 8, true);
   try { inst.exports.main(2, A + 32); } catch (e) { if (e.__exit === undefined) throw e; }
-  const dec = new TextDecoder();
-  return { wat: out.map(b => dec.decode(b)).join(""), stderr: err.map(b => dec.decode(b)).join("") };
+  let total = 0; out.forEach(b => total += b.length);
+  const bytes = new Uint8Array(total); let off = 0;
+  out.forEach(b => { bytes.set(b, off); off += b.length; });
+  return { bytes: bytes, stderr: err.map(b => new TextDecoder().decode(b)).join("") };
 }
 
-// --- assemble .wat -> .wasm (wabt) and run it, capturing putchar() ---
-function assembleAndRun(wat) {
-  const m = wabt.parseWat("prog.wat", wat);
-  m.resolveNames(); m.validate();
-  const { buffer } = m.toBinary({}); m.destroy();
+// --- run a binary .wasm module, capturing putchar() ---
+function runWasm(bytes) {
   let output = "";
   const env = { putchar: (c) => { output += String.fromCharCode(c & 0xff); return c; } };
-  const inst = new WebAssembly.Instance(new WebAssembly.Module(buffer),
+  const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes),
     { env: new Proxy(env, { get: (t, k) => k in t ? t[k] : () => 0 }) });
   const rc = inst.exports.main ? inst.exports.main() : "(no main)";
   return { output, rc };
@@ -123,28 +123,28 @@ function assembleAndRun(wat) {
 
 function go() {
   $("out").textContent = ""; $("wat").textContent = ""; $("err").textContent = "";
-  let r;
-  try { r = compileC($("src").value); }
+  const source = $("src").value;
+  let bin;
+  try { bin = runRcc(source, "wasm-bin"); }
   catch (e) { $("err").innerHTML = '<span class="fail">compiler crashed: ' + e.message + "</span>"; return; }
-  $("wat").textContent = r.wat || "(no .wat emitted)";
-  if (r.stderr) { $("err").innerHTML = '<span class="fail">rcc: ' + r.stderr.trim() + "</span>"; }
-  if (!r.wat.trim()) return;
+  if (bin.stderr) { $("err").innerHTML = '<span class="fail">rcc: ' + bin.stderr.trim() + "</span>"; }
+  if (bin.bytes.length === 0) { $("out").textContent = "(no module emitted)"; return; }
+  // show the human-readable .wat too (the compiler can emit either form)
+  try { $("wat").textContent = new TextDecoder().decode(runRcc(source, "wasm").bytes); } catch (e) {}
   try {
-    const { output, rc } = assembleAndRun(r.wat);
+    const { output, rc } = runWasm(bin.bytes);
     $("out").textContent = output + "\n[main() returned " + rc + "]";
-    if (!r.stderr) $("err").innerHTML = '<span class="ok">compiled ' + r.wat.length + " bytes of .wat, assembled, and ran ✓</span>";
+    if (!bin.stderr)
+      $("err").innerHTML = '<span class="ok">rcc.wasm emitted ' + bin.bytes.length + " bytes of binary .wasm and the browser ran it ✓ (no wabt)</span>";
   } catch (e) {
-    $("err").innerHTML = '<span class="fail">assemble/run: ' + e.message + "</span>";
+    $("err").innerHTML = '<span class="fail">run: ' + e.message + "</span>";
   }
 }
 
 (async function init() {
   try {
-    [rccModule, wabt] = await Promise.all([
-      WebAssembly.compile(await (await fetch("rcc.wasm")).arrayBuffer()),
-      WabtModule(),
-    ]);
-    $("status").textContent = "ready — rcc.wasm (the compiler) + wabt loaded.";
+    rccModule = await WebAssembly.compile(await (await fetch("rcc.wasm")).arrayBuffer());
+    $("status").textContent = "ready — rcc.wasm (the compiler) loaded.";
     $("run").disabled = false;
     $("run").onclick = go;
     go();   // run once on load

@@ -3,32 +3,40 @@
 **LCC compiling *itself* to WebAssembly with the lcc-wasm back end.**
 
 `build-rcc.sh` amalgamates LCC's front end + the wasm back end + the wasm libc
-into one translation unit and compiles it with our own `rcc -target=wasm`,
-producing **`rcc.wasm`** — the LCC C compiler, as a ~260 KB WebAssembly module.
+into one translation unit and compiles it with our own `rcc`, producing
+**`rcc.wasm`** — the LCC C compiler, as a ~280 KB WebAssembly module.
 
 ```sh
-# prereqs: (cd ../.. && make BUILDDIR=build rcc) ; brew install wabt
+# prereqs: (cd ../.. && make BUILDDIR=build rcc) ; brew install wabt (only to BUILD rcc.wasm)
 ./build-rcc.sh          # -> rcc.wasm  (the compiled compiler)
-node compile-and-run.js # rcc.wasm compiles a hello-world, then we run the result
-node run-node.js        # just print the .wat rcc.wasm emits for the hello-world
+node compile-and-run.js # rcc.wasm compiles a hello-world to binary .wasm, then runs it
+node run-node.js        # print the .wat rcc.wasm emits for the hello-world (for reading)
 
 # in the browser: edit C, Compile & Run, all client-side
 node serve.js           # then open http://localhost:8080/
 ```
 
-The host (`run-node.js`) is the model from the discussion: **3 syscalls**
-(`__read`/`__write`/`__exit`) over a tiny in-memory FS — `stdin` is the source,
-`stdout` collects the `.wat`. The browser demo (`index.html`) backs the same 3
-calls with a JS mock filesystem; the wasm is identical.
+`rcc` has two wasm targets: **`-target=wasm`** emits `.wat` text, while
+**`-target=wasm-bin`** emits a binary `.wasm` directly (an in-process assembler,
+`src/wasmbin.c`). The demos use `-target=wasm-bin`, so **no `wat2wasm`/`wabt` is
+needed to run** — `rcc` (native or as `rcc.wasm`) produces a runnable module on
+its own. `wabt` is only used to *build* `rcc.wasm` from the amalgam. (Both targets
+refuse to write output on a compile error and exit non-zero, so a pipeline can't
+ship a module that traps at runtime.)
+
+The host is the model from the discussion: **3 syscalls** (`__read`/`__write`/`__exit`)
+over a tiny in-memory FS — `stdin` is the source, `stdout` is the module bytes. The
+browser demo (`index.html`) backs the same 3 calls with a JS mock filesystem; the
+wasm is identical.
 
 ## Browser demo (`index.html`)
 
 A live, fully client-side C compiler: type C, hit **Compile & Run**, and the page
-runs `rcc.wasm` (the LCC compiler, as wasm) to emit `.wat`, assembles it with
-**wabt** (`wabt.js`, vendored from the `wabt` npm package — the one thing the
-browser can't do natively is wat→wasm), instantiates the result, and runs it —
-capturing `putchar` output. A fresh `rcc.wasm` instance per compile keeps the
-compiler's globals clean. No server-side compilation, no native toolchain.
+runs `rcc.wasm` (the LCC compiler, as wasm) with `-target=wasm-bin` to emit a
+binary `.wasm`, then `WebAssembly.instantiate`s and runs it — capturing `putchar`
+output. A fresh `rcc.wasm` instance per compile keeps the compiler's globals
+clean. **No assembler, no server, no native toolchain — just the ~280 KB
+compiler** (the `.wat` pane shows the readable form `rcc` can also emit).
 
 ## Status: working self-host
 
@@ -36,14 +44,15 @@ compiler's globals clean. No server-side compilation, no native toolchain.
 drives the whole loop:
 
 ```
---- rcc.wasm compiled the C source to .wat (932 bytes) ---
+--- rcc.wasm compiled the C source to a binary .wasm (242 bytes) ---
 --- running the result: Hello from self-hosted lcc-wasm!
 --- main() returned 0 ---
 ```
 
 That is the LCC C compiler — itself running as WebAssembly — reading C source,
-emitting a `.wat` module, which `wat2wasm` assembles and node runs. A real
-compile-and-execute pipeline with no native toolchain involved.
+emitting a runnable binary `.wasm` module that node instantiates and runs. A real
+compile-and-execute pipeline with **no native toolchain and no assembler** in the
+loop.
 
 For non-trivial programs (structs, recursion, `switch`, pointer post-increment,
 globals, arrays), the wasm-hosted `rcc.wasm` produces **byte-for-byte the same
@@ -73,11 +82,10 @@ self-hosting stress test surfaced:
 
 | file | what |
 |------|------|
-| `build-rcc.sh`       | amalgamate LCC + compile it with `rcc -target=wasm` → `rcc.wasm` |
+| `build-rcc.sh`       | amalgamate LCC (incl. `wasmbin.c`) + compile it with `rcc` → `rcc.wasm` |
 | `rcc.wasm`           | the compiled compiler (committed; rebuild with `build-rcc.sh`) |
 | `rcc-amalg.c`        | the generated single-TU amalgamation (intermediate) |
 | `run-node.js`        | host: syscalls + in-memory FS; prints the `.wat` for a hello-world |
-| `compile-and-run.js` | node full loop: compile with `rcc.wasm`, assemble, run, print greeting |
-| `index.html`         | browser demo: edit C, Compile & Run, all client-side |
-| `wabt.js`            | vendored WABT (wat→wasm in the browser; from the `wabt` npm package) |
+| `compile-and-run.js` | node full loop: `rcc.wasm` emits binary `.wasm`, node runs it, prints greeting |
+| `index.html`         | browser demo: edit C, Compile & Run, all client-side (no wabt) |
 | `serve.js`           | static server for the browser demo (`node serve.js` → localhost:8080) |

@@ -1,13 +1,12 @@
-// compile-and-run.js - the full self-host loop in one command.
+// compile-and-run.js - the full self-host loop in one command, no external tools.
 //
-// 1. rcc.wasm (LCC compiled to wasm by lcc-wasm) compiles a C hello-world to .wat
-// 2. wat2wasm assembles that .wat to a .wasm
-// 3. node instantiates and runs it -> prints the greeting
+// 1. rcc.wasm (LCC compiled to wasm by lcc-wasm) compiles a C hello-world
+//    straight to a binary .wasm  (rcc -target=wasm-bin -- no wat2wasm / wabt)
+// 2. node instantiates and runs it -> prints the greeting
 //
-//   node compile-and-run.js          (needs wat2wasm on PATH: brew install wabt)
+//   node compile-and-run.js
 const fs = require("fs");
 const path = require("path");
-const { execFileSync } = require("child_process");
 
 const source = [
   "int putchar(int c);",
@@ -19,7 +18,7 @@ const source = [
   "",
 ].join("\n");
 
-// ---- step 1: run rcc.wasm to compile `source` -> .wat ----
+// ---- run rcc.wasm to compile `source` directly to a binary .wasm ----
 let mem;
 const src = Buffer.from(source), out = [];
 let pos = 0;
@@ -43,22 +42,16 @@ const rcc = new WebAssembly.Instance(
 mem = rcc.exports.memory;
 const A = 0x1f0000, dv = new DataView(mem.buffer), u8 = new Uint8Array(mem.buffer);
 const put = (o, s) => { for (let i = 0; i < s.length; i++) u8[o + i] = s.charCodeAt(i); u8[o + s.length] = 0; };
-put(A, "rcc"); put(A + 8, "-target=wasm");
+put(A, "rcc"); put(A + 8, "-target=wasm-bin");
 dv.setUint32(A + 32, A, true); dv.setUint32(A + 36, A + 8, true);
 try { rcc.exports.main(2, A + 32); } catch (e) { if (e.__exit === undefined) throw e; }
-const wat = Buffer.concat(out).toString();
-console.log("--- rcc.wasm compiled the C source to .wat (" + wat.length + " bytes) ---");
+const wasm = Buffer.concat(out);
+console.log("--- rcc.wasm compiled the C source to a binary .wasm (" + wasm.length + " bytes) ---");
 
-// ---- step 2: wat2wasm assembles the .wat ----
-const watPath = path.join(require("os").tmpdir(), "selfhost-hello.wat");
-const wasmPath = path.join(require("os").tmpdir(), "selfhost-hello.wasm");
-fs.writeFileSync(watPath, wat);
-execFileSync("wat2wasm", [watPath, "-o", wasmPath]);
-
-// ---- step 3: run the produced module ----
+// ---- run the produced module (no wabt: rcc emitted the binary itself) ----
 let greeting = "";
 const hello = new WebAssembly.Instance(
-  new WebAssembly.Module(fs.readFileSync(wasmPath)),
+  new WebAssembly.Module(wasm),
   { env: { putchar: (c) => { greeting += String.fromCharCode(c); return c; } } });
 const rc = hello.exports.main();
 process.stdout.write("--- running the result: " + greeting);
