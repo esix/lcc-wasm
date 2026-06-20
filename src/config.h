@@ -1,3 +1,5 @@
+#ifndef LCC_CONFIG_H
+#define LCC_CONFIG_H
 /* $Id$ */
 typedef struct {
 	unsigned char max_unaligned_load;
@@ -101,4 +103,5 @@ extern unsigned         emitbin(Node, int);
 #define debug(x) (void)0
 #else
 #define debug(x) (void)(dflag&&((x),0))
+#endif
 #endif

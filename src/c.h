@@ -1,3 +1,5 @@
+#ifndef LCC_C_H
+#define LCC_C_H
 /* $Id$ */
 #include <assert.h>
 #include <stdarg.h>
@@ -598,3 +600,4 @@ extern void rmtypes(int);
 extern int ttob(Type);
 extern int variadic(Type);
 
+#endif
