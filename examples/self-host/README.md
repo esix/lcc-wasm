@@ -33,6 +33,10 @@ That is the LCC C compiler — itself running as WebAssembly — reading C sourc
 emitting a `.wat` module, which `wat2wasm` assembles and node runs. A real
 compile-and-execute pipeline with no native toolchain involved.
 
+For non-trivial programs (structs, recursion, `switch`, pointer post-increment,
+globals, arrays), the wasm-hosted `rcc.wasm` produces **byte-for-byte the same
+`.wat` as the native `rcc`** — the self-host is faithful, not a reduced subset.
+
 Getting here required fixing several real back-end bugs that only the
 self-hosting stress test surfaced:
 
@@ -43,18 +47,15 @@ self-hosting stress test surfaced:
   corrupting the tokenizer's keyword dispatch. Fixed by deferring code→data
   address resolution (and derived `base+offset` aliases) until each symbol is
   byte-counted by its own definition.
+- **address-taken parameters** — a scalar parameter whose address is taken
+  (`f(T x){ ... &x ... }`) was left as a wasm local, so `&x` had no valid
+  address. LCC's own de-dag/spill pass does exactly this (`prune`/`undag` take
+  `&forest` of their pointer parameter), so the miscompiled compiler then
+  dropped the temp-spill for `*p++` and similar. Fixed by spilling such params
+  to the shadow-stack frame and copying the incoming arg into the slot.
 - **`printf` length/width** — the wasm back end prints constants with `%ld`/`%lu`
   and data bytes with `%02x`; the hand-written libc `vformat` didn't handle the
   `l` length modifier or `0`/width flags. Fixed in `lib/wasm/libc.c`.
-
-## Known limitation
-
-A few front-end constructs in the de-dag/spill pass are still miscompiled when
-LCC runs as wasm; the most visible is post-increment through a pointer (`*p++`),
-which emits an `;; UNSUPPORTED` marker. Write the equivalent with explicit
-indexing (`s[i]; i = i + 1;`) and it compiles cleanly — that is what the demo
-programs do. Native `rcc` compiles `*p++` correctly, so this is a self-host
-codegen bug, not a language gap.
 
 ## Files
 
