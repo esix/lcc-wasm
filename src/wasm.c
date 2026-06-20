@@ -21,6 +21,11 @@
 
 #define I(f) wasm_##f
 
+/* assemble the .wat text we build into a binary .wasm module (src/wasmbin.c);
+   used by -target=wasm-bin */
+extern unsigned char *wasm_assemble(const char *text, int *outlen);
+static int g_binmode;   /* 1 => emit binary .wasm, 0 => emit .wat text */
+
 /* ---- growable output buffers (assembled into module order at progend) ---- */
 typedef struct { char *p; int len, cap; } Buf;
 static Buf imports, funcs, exports;
@@ -670,12 +675,20 @@ static void flushdata(void) {
 }
 
 static void I(progbeg)(int argc, char *argv[]) {
+	int i;
 	imports.p = funcs.p = exports.p = data.p = 0;
 	imports.len = funcs.len = exports.len = data.len = 0;
 	imports.cap = funcs.cap = exports.cap = data.cap = 0;
 	pending.p = 0; pending.len = pending.cap = 0;
 	dataoff = 16; litoff = LITBASE; curoff = &dataoff; noadvance = 0; curseg = 0;
-	ntable = 0; argc = 0;
+	ntable = 0;
+	/* "wasm" and "wasm-bin" share this back end; the last -target= picks the mode */
+	g_binmode = 0;
+	for (i = argc - 1; i > 0; i--)
+		if (strncmp(argv[i], "-target=", 8) == 0) {
+			g_binmode = strcmp(&argv[i][8], "wasm-bin") == 0;
+			break;
+		}
 }
 
 /* rewrite the funcs buffer, replacing each "@@N@@" placeholder with the now-known
@@ -707,26 +720,46 @@ static void resolverefs(void) {
 
 static void I(progend)(void) {
 	int i;
+	Buf mod;
+	/* §6.1/§6.2: never emit a (trapping) module after a compile error -- a
+	   stdout-consuming pipeline would otherwise ship code that traps at runtime.
+	   main() already returns errcnt>0 as the exit status. */
+	if (errcnt > 0) {
+		fprint(stderr, "rcc: %d error%s; no wasm emitted\n", errcnt, errcnt == 1 ? "" : "s");
+		return;
+	}
 	flushdata();
 	resolverefs();
-	print("(module\n");
-	if (imports.p) print("%s", imports.p);
-	print("(memory %d)\n", MEMPAGES);
-	print("(export \"memory\" (memory 0))\n");
+	/* build the full module text (same bytes as the historical .wat output) */
+	mod.p = 0; mod.len = mod.cap = 0;
+	bput(&mod, "(module\n");
+	if (imports.p) bput(&mod, imports.p);
+	bfmt(&mod, "(memory %d)\n", MEMPAGES);
+	bput(&mod, "(export \"memory\" (memory 0))\n");
 	/* always declare the table so a call_indirect validates even in a unit that
 	   takes no function address locally (the elem is populated only if ntable>0) */
-	print("(table %d funcref)\n", ntable);
-	print("(export \"__indirect_function_table\" (table 0))\n");
-	print("(global $sp (mut i32) (i32.const %d))\n", STACKTOP);
-	if (funcs.p)   print("%s", funcs.p);
-	if (exports.p) print("%s", exports.p);
+	bfmt(&mod, "(table %d funcref)\n", ntable);
+	bput(&mod, "(export \"__indirect_function_table\" (table 0))\n");
+	bfmt(&mod, "(global $sp (mut i32) (i32.const %d))\n", STACKTOP);
+	if (funcs.p)   bput(&mod, funcs.p);
+	if (exports.p) bput(&mod, exports.p);
 	if (ntable > 0) {
-		print("(elem (i32.const 0)");
-		for (i = 0; i < ntable; i++) print(" $%s", tablefn[i]);
-		print(")\n");
+		bput(&mod, "(elem (i32.const 0)");
+		for (i = 0; i < ntable; i++) bfmt(&mod, " $%s", tablefn[i]);
+		bput(&mod, ")\n");
 	}
-	if (data.p)    print("%s", data.p);
-	print(")\n");
+	if (data.p)    bput(&mod, data.p);
+	bput(&mod, ")\n");
+
+	if (g_binmode) {
+		int n = 0;
+		unsigned char *bytes = wasm_assemble(mod.p ? mod.p : "(module)", &n);
+		if (bytes) { fwrite(bytes, 1, (size_t)n, stdout); free(bytes); }
+	} else if (mod.p) {
+		fwrite(mod.p, 1, (size_t)mod.len, stdout);
+	}
+	fflush(stdout);
+	free(mod.p);
 }
 
 /* ---- data / segment hooks ---- */

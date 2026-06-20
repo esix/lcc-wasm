@@ -12,6 +12,7 @@ xx(symbolic/irix,symbolicIR) \
 xx(symbolic,     symbolicIR) \
 xx(bytecode,     bytecodeIR) \
 xx(wasm,         wasmIR) \
+xx(wasm-bin,     wasmIR) \
 xx(null,         nullIR)
 
 #undef xx
