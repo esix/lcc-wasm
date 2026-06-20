@@ -340,20 +340,35 @@ static void emitexpr(Node p) {
 		/* generic = source class, node type/size = target; syms[0] = source size */
 		char *src, *dst = opprefix(op);
 		int srcsz = p->syms[0] ? (int)p->syms[0]->u.c.v.i : opsize(l->op);
+		int dstsz = opsize(op);
 		int srcclass = generic(op);  /* CVI/CVU from int/unsigned; CVF from float; CVP from ptr */
 		emitexpr(l);
 		src = (srcclass == CVF) ? (srcsz <= 4 ? "f32" : "f64") : (srcsz <= 4 ? "i32" : "i64");
-		if (strcmp(src, dst) == 0) return;                       /* same wasm type: nop */
-		if (src[0] == 'i' && dst[0] == 'i') {                    /* int<->int width */
-			if (dst[1] == '6') bfmt(&funcs, "i64.extend_i32_%s\n", srcclass == CVU ? "u" : "s");
-			else bfmt(&funcs, "i32.wrap_i64\n");
-		} else if (src[0] == 'f' && dst[0] == 'f') {
-			bfmt(&funcs, dst[1] == '3' ? "f32.demote_f64\n" : "f64.promote_f32\n");
-		} else if (src[0] == 'i' && dst[0] == 'f') {             /* int -> float */
-			bfmt(&funcs, "%s.convert_%s_%s\n", dst, src, srcclass == CVU ? "u" : "s");
-		} else {                                                 /* float -> int */
-			bfmt(&funcs, "%s.trunc_%s_%s\n", dst, src, optype(op) == U ? "u" : "s");
+		if (src[0] == 'i' && dst[0] == 'i') {                    /* integer conversions */
+			if (srcsz <= 4 && dstsz > 4)                          /* widen i32 -> i64 */
+				bfmt(&funcs, "i64.extend_i32_%s\n", srcclass == CVU ? "u" : "s");
+			else if (srcsz > 4 && dstsz <= 4)                     /* narrow i64 -> i32 */
+				bput(&funcs, "i32.wrap_i64\n");
+			/* wasm has no sub-i32 integer types: a narrowing cast to char/short
+			   must make the value canonical -- mask for unsigned, sign-extend
+			   (via shifts, so it also works in the binary back end) for signed.
+			   Without this, (unsigned char)x kept x's high bits (e.g. 0xffffffa8). */
+			if (dstsz < 4 && dstsz < srcsz) {
+				if (optype(op) == U)
+					bfmt(&funcs, "i32.const %d\ni32.and\n", dstsz == 1 ? 0xff : 0xffff);
+				else
+					bfmt(&funcs, "i32.const %d\ni32.shl\ni32.const %d\ni32.shr_s\n",
+					     32 - dstsz * 8, 32 - dstsz * 8);
+			}
+			return;
 		}
+		if (strcmp(src, dst) == 0) return;                       /* same float type: nop */
+		if (src[0] == 'f' && dst[0] == 'f')
+			bfmt(&funcs, dst[1] == '3' ? "f32.demote_f64\n" : "f64.promote_f32\n");
+		else if (src[0] == 'i' && dst[0] == 'f')                 /* int -> float */
+			bfmt(&funcs, "%s.convert_%s_%s\n", dst, src, srcclass == CVU ? "u" : "s");
+		else                                                     /* float -> int */
+			bfmt(&funcs, "%s.trunc_%s_%s\n", dst, src, optype(op) == U ? "u" : "s");
 		return;
 	}
 	case ADDRG: case ADDRL: case ADDRF:
