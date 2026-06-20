@@ -166,17 +166,34 @@ static char *fmtu(char *p, unsigned v, unsigned base) {
 static int vformat(char *out, const char *fmt, va_list ap) {
 	char *p = out;
 	for (; *fmt; fmt++) {
+		char num[24], *body = num;
+		int len = 0, width = 0, zero = 0, i;
 		if (*fmt != '%') { *p++ = *fmt; continue; }
 		fmt++;
-		switch (*fmt) {
-		case 'd': { int v = va_arg(ap, int); if (v < 0) { *p++ = '-'; v = -v; } p = fmtu(p, v, 10); break; }
-		case 'u': p = fmtu(p, va_arg(ap, unsigned), 10); break;
-		case 'x': p = fmtu(p, va_arg(ap, unsigned), 16); break;
-		case 'c': *p++ = (char)va_arg(ap, int); break;
-		case 's': { char *s = va_arg(ap, char *); while (*s) *p++ = *s++; break; }
-		case '%': *p++ = '%'; break;
-		default:  *p++ = '%'; *p++ = *fmt; break;
+		while (*fmt=='-' || *fmt=='+' || *fmt==' ' || *fmt=='#' || *fmt=='0') {  /* flags */
+			if (*fmt == '0') zero = 1;
+			fmt++;
 		}
+		while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');   /* field width */
+		while (*fmt == 'l' || *fmt == 'h') fmt++;   /* length modifiers: long==int==32-bit here */
+		switch (*fmt) {
+		case 'd': { int v = va_arg(ap, int); char *q = num;
+			    if (v < 0) { *q++ = '-'; len = fmtu(q, (unsigned)(-(long)v), 10) - num; }
+			    else len = fmtu(q, (unsigned)v, 10) - num; break; }
+		case 'u': len = fmtu(num, va_arg(ap, unsigned), 10) - num; break;
+		case 'x': len = fmtu(num, va_arg(ap, unsigned), 16) - num; break;
+		case 'c': num[0] = (char)va_arg(ap, int); len = 1; break;
+		case 's': body = va_arg(ap, char *); len = (int)strlen(body); break;
+		case '%': num[0] = '%'; len = 1; break;
+		default:  num[0] = '%'; num[1] = *fmt; len = 2; break;
+		}
+		if (width > len) {                          /* left-pad to field width */
+			int extra = width - len;
+			char pad = zero ? '0' : ' ';
+			if (zero && len > 0 && body[0] == '-') { *p++ = '-'; body++; len--; }
+			for (i = 0; i < extra; i++) *p++ = pad;
+		}
+		for (i = 0; i < len; i++) *p++ = body[i];
 	}
 	*p = 0;
 	return p - out;
