@@ -40,16 +40,22 @@ segments; goto-style control flow becomes a br_table "giant loop" dispatch;
 function pointers use an indirect (table) + call_indirect. Output is buffered
 into import/memory/table/func/export/data so it assembles in module order.
 
+For the full opcode-by-opcode mapping (LCC IR <-> WAT) with worked, verified
+examples, see doc/wasm-codegen.md.
+
 --- Status (milestones; see PLAN.md in the repo root) -----------------
 
   M1 DONE  arithmetic/bitwise/shift/casts, scalar locals, direct calls, return
   M2 DONE  control flow: for/while/if/switch/recursion (br_table dispatch)
   M3 DONE  linear memory + shadow stack; globals/strings; loads/stores;
            pointers, arrays, struct fields
-  M4 ....  function pointers (call_indirect) and struct copy DONE; varargs and
-           struct-by-value still TODO
-  M5 next  in-browser pipeline: cpp+rcc via emcc, MEMFS, Win32 host imports
-  M6 goal  self-host: compile lcc itself to wasm
+  M4 DONE  function pointers (call_indirect), struct copy, struct-by-value,
+           varargs (shadow-stack arg-buffer ABI)
+  M6 DONE  self-host: lcc compiled to wasm (rcc.wasm) compiles + runs C in node
+           AND the browser, byte-identical to native -- see examples/self-host
+  M7 DONE  direct binary emit: -target=wasm-bin writes .wasm with no wat2wasm
+           (drops the in-browser wabt dependency)
+  M5 next  winweb integration: wire rcc.wasm into the in-page Win32 runtime
 
 Upstream lcc README follows.
 
